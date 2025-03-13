@@ -315,6 +315,8 @@ LogicalType SubstraitToDuckDB::SubstraitToDuckType(const substrait::Type &s_type
 	case substrait::Type::KindCase::kVarchar:
 	case substrait::Type::KindCase::kString:
 		return {LogicalTypeId::VARCHAR};
+	case substrait::Type::KindCase::kFp32:
+		return {LogicalTypeId::FLOAT};
 	case substrait::Type::KindCase::kFp64:
 		return {LogicalTypeId::DOUBLE};
 	default:
