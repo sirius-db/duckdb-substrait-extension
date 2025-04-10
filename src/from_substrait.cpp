@@ -114,6 +114,10 @@ Value TransformLiteralToValue(const substrait::Expression_Literal &literal) {
 		return {literal.string()};
 	case substrait::Expression_Literal::LiteralTypeCase::kDecimal: {
 		const auto &substrait_decimal = literal.decimal();
+		if (substrait_decimal.value().size() != 16) {
+			throw InvalidInputException("Decimal value must have 16 bytes, but has " +
+			                            std::to_string(substrait_decimal.value().size()));
+		}
 		auto raw_value = reinterpret_cast<const uint64_t *>(substrait_decimal.value().c_str());
 		hugeint_t substrait_value {};
 		substrait_value.lower = raw_value[0];
@@ -133,7 +137,7 @@ Value TransformLiteralToValue(const substrait::Expression_Literal &literal) {
 		case PhysicalType::INT128:
 			return Value::DECIMAL(substrait_value, substrait_decimal.precision(), substrait_decimal.scale());
 		default:
-			throw InternalException("Not accepted internal type for decimal");
+			throw NotImplementedException("Unsupported internal type for decimal: %s", decimal_type.ToString());
 		}
 	}
 	case substrait::Expression_Literal::LiteralTypeCase::kBoolean: {
@@ -170,7 +174,8 @@ Value TransformLiteralToValue(const substrait::Expression_Literal &literal) {
 	case substrait::Expression_Literal::LiteralTypeCase::kVarChar:
 		return {literal.var_char().value()};
 	default:
-		throw SyntaxException("literals of this type number are not implemented: " + to_string(literal.literal_type_case()));
+		throw NotImplementedException("literals of this type are not implemented: %s",
+			substrait::Expression_Literal::GetDescriptor()->FindFieldByNumber(literal.literal_type_case())->name());
 	}
 }
 
@@ -180,7 +185,7 @@ unique_ptr<ParsedExpression> SubstraitToDuckDB::TransformLiteralExpr(const subst
 
 unique_ptr<ParsedExpression> SubstraitToDuckDB::TransformSelectionExpr(const substrait::Expression &sexpr) {
 	if (!sexpr.selection().has_direct_reference() || !sexpr.selection().direct_reference().has_struct_field()) {
-		throw InternalException("Can only have direct struct references in selections");
+		throw SyntaxException("Can only have direct struct references in selections");
 	}
 	return make_uniq<PositionalReferenceExpression>(sexpr.selection().direct_reference().struct_field().field() + 1);
 }
@@ -320,7 +325,8 @@ LogicalType SubstraitToDuckDB::SubstraitToDuckType(const substrait::Type &s_type
 	case substrait::Type::KindCase::kFp64:
 		return {LogicalTypeId::DOUBLE};
 	default:
-		throw NotImplementedException("Substrait type not yet supported");
+		throw NotImplementedException("Substrait type not yet supported: %s",
+			substrait::Type::GetDescriptor()->FindFieldByNumber(s_type.kind_case())->name());
 	}
 }
 
@@ -406,13 +412,15 @@ unique_ptr<ParsedExpression> SubstraitToDuckDB::TransformExpr(const substrait::E
 		return TransformNested(sexpr, iterator);
 	case substrait::Expression::RexTypeCase::kSubquery:
 	default:
-		throw InternalException("Unsupported expression type " + to_string(sexpr.rex_type_case()));
+		throw NotImplementedException("Unsupported expression type %s",
+			substrait::Expression::GetDescriptor()->FindFieldByNumber(sexpr.rex_type_case())->name());
 	}
 }
 
 string SubstraitToDuckDB::FindFunction(uint64_t id) {
 	if (functions_map.find(id) == functions_map.end()) {
-		throw InternalException("Could not find aggregate function " + to_string(id));
+		throw NotImplementedException("Could not find aggregate function %s",
+			to_string(id));
 	}
 	return functions_map[id];
 }
@@ -440,7 +448,8 @@ OrderByNode SubstraitToDuckDB::TransformOrder(const substrait::SortField &sordf)
 		dnullorder = OrderByNullType::NULLS_LAST;
 		break;
 	default:
-		throw InternalException("Unsupported ordering " + to_string(sordf.direction()));
+		throw NotImplementedException("Unsupported ordering %s",
+			substrait::SortField::GetDescriptor()->FindFieldByNumber(sordf.direction())->name());
 	}
 
 	return {dordertype, dnullorder, TransformExpr(sordf.expr())};
@@ -479,7 +488,8 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformJoinOp(const substrait::Rel &so
 		djointype = JoinType::RIGHT_ANTI;
 		break;
 	default:
-		throw InternalException("Unsupported join type");
+		throw NotImplementedException("Unsupported join type: %s",
+			substrait::JoinRel::GetDescriptor()->FindFieldByNumber(sjoin.type())->name());
 	}
 	unique_ptr<ParsedExpression> join_condition = TransformExpr(sjoin.expression());
 	return make_shared_ptr<JoinRelation>(TransformOp(sjoin.left())->Alias("left"),
@@ -507,22 +517,110 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformFilterOp(const substrait::Rel &
 	return make_shared_ptr<FilterRelation>(TransformOp(sfilter.input()), TransformExpr(sfilter.condition()));
 }
 
+const substrait::RelCommon* GetCommon(const substrait::Rel &sop) {
+	const substrait::RelCommon * common;
+	switch (sop.rel_type_case()) {
+	case substrait::Rel::RelTypeCase::kRead:
+		return &sop.read().common();
+	case substrait::Rel::RelTypeCase::kFilter:
+		return &sop.filter().common();
+	case substrait::Rel::RelTypeCase::kFetch:
+		return &sop.fetch().common();
+	case substrait::Rel::RelTypeCase::kAggregate:
+		return &sop.aggregate().common();
+	case substrait::Rel::RelTypeCase::kSort:
+		return &sop.sort().common();
+	case substrait::Rel::RelTypeCase::kJoin:
+		return &sop.join().common();
+	case substrait::Rel::RelTypeCase::kProject:
+		return &sop.project().common();
+	case substrait::Rel::RelTypeCase::kSet:
+		return &sop.set().common();
+	case substrait::Rel::RelTypeCase::kExtensionSingle:
+		return &sop.extension_single().common();
+	case substrait::Rel::RelTypeCase::kExtensionMulti:
+		return &sop.extension_multi().common();
+	case substrait::Rel::RelTypeCase::kExtensionLeaf:
+		return &sop.extension_leaf().common();
+	case substrait::Rel::RelTypeCase::kCross:
+		return &sop.cross().common();
+	case substrait::Rel::RelTypeCase::kHashJoin:
+		return &sop.hash_join().common();
+	case substrait::Rel::RelTypeCase::kMergeJoin:
+		return &sop.merge_join().common();
+	case substrait::Rel::RelTypeCase::kNestedLoopJoin:
+		return &sop.nested_loop_join().common();
+	case substrait::Rel::RelTypeCase::kWindow:
+		return &sop.window().common();
+	case substrait::Rel::RelTypeCase::kExchange:
+		return &sop.exchange().common();
+	case substrait::Rel::RelTypeCase::kExpand:
+		return &sop.expand().common();
+	case substrait::Rel::RelTypeCase::kWrite:
+	case substrait::Rel::RelTypeCase::kUpdate:
+	case substrait::Rel::RelTypeCase::kDdl:
+	default:
+		throw NotImplementedException("Unsupported relation type %s",
+			substrait::Rel::GetDescriptor()->FindFieldByNumber(sop.rel_type_case())->name());
+	}
+}
+
+const google::protobuf::RepeatedField<int32_t>& GetOutputMapping(const substrait::Rel &sop) {
+	const substrait::RelCommon* common = GetCommon(sop);
+	if (!common->has_emit()) {
+		static google::protobuf::RepeatedField<int32_t> empty_mapping;
+		return empty_mapping;
+	}
+	return common->emit().output_mapping();
+}
+
 shared_ptr<Relation>
 SubstraitToDuckDB::TransformProjectOp(const substrait::Rel &sop,
                                       const google::protobuf::RepeatedPtrField<std::string> *names) {
 	vector<unique_ptr<ParsedExpression>> expressions;
 	RootNameIterator iterator(names);
 
-	for (auto &sexpr : sop.project().expressions()) {
-		expressions.push_back(TransformExpr(sexpr, &iterator));
+	auto &input = sop.project().input();
+	auto hasZeroColumnVirtualTable = false;
+	shared_ptr<Relation> input_rel;
+	size_t num_input_columns = 0;
+	if (sop.project().input().rel_type_case() == substrait::Rel::RelTypeCase::kRead) {
+		auto &sget = sop.project().input().read();
+		if (sget.has_virtual_table() && sget.virtual_table().values().empty()) {
+			hasZeroColumnVirtualTable = true;
+			input_rel = GetValueRelationWithSingleBoolColumn();
+		}
+	}
+	if (!hasZeroColumnVirtualTable) {
+		input_rel = TransformOp(input);
+		num_input_columns = input_rel->Columns().size();
+	}
+
+	auto mapping = GetOutputMapping(sop);
+	if (mapping.empty()) {
+		for (int i = 1; i <= num_input_columns; i++) {
+			expressions.push_back(make_uniq<PositionalReferenceExpression>(i));
+		}
+
+		for (auto &sexpr : sop.project().expressions()) {
+			expressions.push_back(TransformExpr(sexpr, &iterator));
+		}
+	} else {
+		expressions.resize(mapping.size());
+		for (size_t i = 0; i < mapping.size(); i++) {
+			if (mapping[i] < num_input_columns) {
+				expressions[i] = make_uniq<PositionalReferenceExpression>(mapping[i] + 1);
+			} else {
+				expressions[i] = TransformExpr(sop.project().expressions(mapping[i] - num_input_columns), &iterator);
+			}
+		}
 	}
 
 	vector<string> mock_aliases;
 	for (size_t i = 0; i < expressions.size(); i++) {
 		mock_aliases.push_back("expr_" + to_string(i));
 	}
-	return make_shared_ptr<ProjectionRelation>(TransformOp(sop.project().input()), std::move(expressions),
-	                                           std::move(mock_aliases));
+	return make_shared_ptr<ProjectionRelation>(input_rel, std::move(expressions), std::move(mock_aliases));
 }
 
 shared_ptr<Relation> SubstraitToDuckDB::TransformAggregateOp(const substrait::Rel &sop) {
@@ -702,6 +800,23 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformReadOp(const substrait::Rel &so
 	return scan;
 }
 
+shared_ptr<Relation> SubstraitToDuckDB::GetValueRelationWithSingleBoolColumn() {
+	vector<vector<unique_ptr<ParsedExpression>>> expressions;
+	vector<unique_ptr<ParsedExpression>> expression_row;
+	expressions.emplace_back(std::move(expression_row));
+	Value result(LogicalType::BOOLEAN);
+	expressions[0].emplace_back(make_uniq<ConstantExpression>(result));
+	vector<string> column_names;
+	shared_ptr<Relation> scan;
+	if (acquire_lock) {
+		scan = make_shared_ptr<ValueRelation>(context, std::move(expressions), column_names);
+	} else {
+		auto context_wrapper = make_shared_ptr<RelationContextWrapper>(context);
+		scan = make_shared_ptr<ValueRelation>(context_wrapper, std::move(expressions), column_names);
+	}
+	return scan;
+}
+
 shared_ptr<Relation> SubstraitToDuckDB::GetValuesExpression(const google::protobuf::RepeatedPtrField<substrait::Expression_Nested_Struct> &expression_rows) {
 	vector<vector<unique_ptr<ParsedExpression>>> expressions;
 	for (auto &row : expression_rows) {
@@ -710,10 +825,6 @@ shared_ptr<Relation> SubstraitToDuckDB::GetValuesExpression(const google::protob
 			expression_row.emplace_back(TransformExpr(expr));
 		}
 		expressions.emplace_back(std::move(expression_row));
-	}
-	if (expressions.size() == 1 && expressions[0].empty()) {
-		// add a dummy column, as DuckDB does not support zero column ValueRelation
-		expressions[0].emplace_back(make_uniq<ConstantExpression>(Value::BOOLEAN(true)));
 	}
 	vector<string> column_names;
 	shared_ptr<Relation> scan;
@@ -747,7 +858,8 @@ static SetOperationType TransformSetOperationType(substrait::SetRel_SetOp setop)
 		return SetOperationType::INTERSECT;
 	}
 	default: {
-		throw NotImplementedException("SetOperationType transform not implemented for SetRel_SetOp type %d", setop);
+		throw NotImplementedException("SetOperationType transform not implemented for SetRel_SetOp type %s",
+			substrait::SetRel::GetDescriptor()->FindFieldByNumber(setop)->name());
 	}
 	}
 }
@@ -779,22 +891,39 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformWriteOp(const substrait::Rel &s
 	auto table_idx = nobj.names_size() - 1;
 	auto table_name = nobj.names(table_idx);
 	string schema_name;
+	string catalog_name;
 	if (table_idx > 0) {
-		schema_name = nobj.names(0);
+		if (table_idx == 1) {
+			schema_name = nobj.names(0);
+		} else {
+			catalog_name = nobj.names(0);
+			schema_name = nobj.names(1);
+		}
 	}
 	auto input = TransformOp(swrite.input());
 	switch (swrite.op()) {
-        case substrait::WriteRel::WriteOp::WriteRel_WriteOp_WRITE_OP_CTAS:
-	        return input->CreateRel(schema_name, table_name);
+    case substrait::WriteRel::WriteOp::WriteRel_WriteOp_WRITE_OP_CTAS:
+	    return input->CreateRel(schema_name, table_name);
 	case substrait::WriteRel::WriteOp::WriteRel_WriteOp_WRITE_OP_INSERT:
 		return input->InsertRel(schema_name, table_name);
-        case substrait::WriteRel::WriteOp::WriteRel_WriteOp_WRITE_OP_DELETE: {
-        	auto filter = std::move(input.get()->Cast<FilterRelation>());
-        	auto context = filter.child->Cast<TableRelation>().context;
-        	return make_shared_ptr<DeleteRelation>(filter.context, std::move(filter.condition), schema_name, table_name);
-        }
+	case substrait::WriteRel::WriteOp::WriteRel_WriteOp_WRITE_OP_DELETE: {
+		switch (input->type) {
+		case RelationType::PROJECTION_RELATION: {
+			auto project = std::move(input.get()->Cast<ProjectionRelation>());
+			auto filter = std::move(project.child->Cast<FilterRelation>());
+        	return make_shared_ptr<DeleteRelation>(filter.context, std::move(filter.condition), catalog_name, schema_name, table_name);
+		}
+		case RelationType::FILTER_RELATION: {
+			auto filter = std::move(input.get()->Cast<FilterRelation>());
+			return make_shared_ptr<DeleteRelation>(filter.context, std::move(filter.condition), catalog_name, schema_name, table_name);
+		}
+		default:
+			throw NotImplementedException("Unsupported relation type for delete operation");
+		}
+	}
 	default:
-		throw NotImplementedException("Unsupported write operation " + to_string(swrite.op()));
+		throw NotImplementedException("Unsupported write operation %s",
+			substrait::WriteRel::GetDescriptor()->FindFieldByNumber(swrite.op())->name());
 	}
 }
 
@@ -822,7 +951,8 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformOp(const substrait::Rel &sop,
 	case substrait::Rel::RelTypeCase::kWrite:
 		return TransformWriteOp(sop);
 	default:
-		throw InternalException("Unsupported relation type " + to_string(sop.rel_type_case()));
+		throw NotImplementedException("Unsupported relation type %s",
+			substrait::Rel::GetDescriptor()->FindFieldByNumber(sop.rel_type_case())->name());
 	}
 }
 
@@ -867,6 +997,9 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformRootOp(const substrait::RelRoot
 	if (first_projection_or_table) {
 		vector<ColumnDefinition> *column_definitions = &first_projection_or_table->Cast<ProjectionRelation>().columns;
 		int32_t i = 0;
+		if (column_definitions->size() > column_names.size()) {
+			throw InvalidInputException("Number of column names less than number of column definitions");
+		}
 		for (auto &column : *column_definitions) {
 			aliases.push_back(column_names[i++]);
 			auto column_type = column.GetType();
