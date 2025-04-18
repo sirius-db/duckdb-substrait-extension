@@ -59,6 +59,9 @@ public:
 	//! Transforms Substrait Plan to DuckDB Relation
 	shared_ptr<Relation> TransformPlan();
 
+	//! Get substrait plan
+	const substrait::Plan* get_substrait_plan() const { return &plan; }
+
 private:
 	//! Transforms Substrait Plan Root To a DuckDB Relation
 	shared_ptr<Relation> TransformRootOp(const substrait::RelRoot &sop);
