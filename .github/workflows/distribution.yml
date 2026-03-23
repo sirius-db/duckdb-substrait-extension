@@ -26,7 +26,7 @@ jobs:
     name: Build extension binaries
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@16d89a59ee14904a62383e83c300432b19d29abc
     with:
-      duckdb_version: 3a3967aa8190d0a2d1931d4ca4f5d920760030b4
+      duckdb_version: 7dbb2e646fea939a89f10a55aa98c474cbb0c098
       ci_tools_version: 16d89a59ee14904a62383e83c300432b19d29abc
       exclude_archs: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64;windows_amd64_mingw"
       extension_name: substrait
@@ -37,7 +37,7 @@ jobs:
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_deploy.yml@16d89a59ee14904a62383e83c300432b19d29abc
     secrets: inherit
     with:
-      duckdb_version: 3a3967aa8190d0a2d1931d4ca4f5d920760030b4
+      duckdb_version: 7dbb2e646fea939a89f10a55aa98c474cbb0c098
       ci_tools_version: 16d89a59ee14904a62383e83c300432b19d29abc
       exclude_archs: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64;windows_amd64_mingw"
       extension_name: substrait
