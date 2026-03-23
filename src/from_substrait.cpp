@@ -14,6 +14,7 @@
 #include "duckdb/planner/operator/logical_cteref.hpp"
 
 #include "duckdb/parser/expression/comparison_expression.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 
 #include "duckdb/main/client_data.hpp"
 #include "google/protobuf/util/json_util.h"
@@ -519,6 +520,59 @@ OrderByNode SubstraitToDuckDB::TransformOrder(const substrait::SortField &sordf)
 	return {dordertype, dnullorder, TransformExpr(sordf.expr())};
 }
 
+// Collect column names from a Substrait Rel's output schema.
+static vector<string> GetSubstraitRelColumnNames(const substrait::Rel &rel) {
+	vector<string> names;
+	switch (rel.rel_type_case()) {
+	case substrait::Rel::RelTypeCase::kRead:
+		if (rel.read().has_base_schema()) {
+			for (auto &name : rel.read().base_schema().names()) {
+				names.push_back(name);
+			}
+		}
+		break;
+	case substrait::Rel::RelTypeCase::kFilter:
+		names = GetSubstraitRelColumnNames(rel.filter().input());
+		break;
+	case substrait::Rel::RelTypeCase::kSort:
+		names = GetSubstraitRelColumnNames(rel.sort().input());
+		break;
+	case substrait::Rel::RelTypeCase::kProject:
+		names = GetSubstraitRelColumnNames(rel.project().input());
+		break;
+	default:
+		break;
+	}
+	return names;
+}
+
+// Rewrite PositionalReferenceExpression nodes in a join condition into
+// ColumnRefExpression with the correct table alias ("left"/"right") and column
+// name.  Substrait JoinRel expressions use combined-schema field indices
+// (left fields 0..N-1, right fields N..N+M-1), but DuckDB's JoinRelation
+// with Alias("left")/Alias("right") expects table-qualified column names.
+static void RewriteJoinCondition(unique_ptr<ParsedExpression> &expr,
+                                  const vector<string> &left_cols,
+                                  const vector<string> &right_cols) {
+	if (expr->type == ExpressionType::POSITIONAL_REFERENCE) {
+		auto &pos_ref = expr->Cast<PositionalReferenceExpression>();
+		idx_t idx = pos_ref.index - 1; // back to 0-based
+		if (idx < left_cols.size()) {
+			expr = make_uniq<ColumnRefExpression>(left_cols[idx], "left");
+		} else {
+			idx_t right_idx = idx - left_cols.size();
+			if (right_idx < right_cols.size()) {
+				expr = make_uniq<ColumnRefExpression>(right_cols[right_idx], "right");
+			}
+		}
+		return;
+	}
+	// Recurse into child expressions via DuckDB's expression iterator.
+	ParsedExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<ParsedExpression> &child) {
+		RewriteJoinCondition(child, left_cols, right_cols);
+	});
+}
+
 shared_ptr<Relation> SubstraitToDuckDB::TransformJoinOp(const substrait::Rel &sop) {
 	auto &sjoin = sop.join();
 
@@ -547,6 +601,16 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformJoinOp(const substrait::Rel &so
 		                              substrait::JoinRel::GetDescriptor()->FindFieldByNumber(sjoin.type())->name());
 	}
 	unique_ptr<ParsedExpression> join_condition = TransformExpr(sjoin.expression());
+
+	// Rewrite positional references in the join condition into named column
+	// references (left.col / right.col).  Substrait uses combined-schema
+	// field indices, but DuckDB JoinRelation with Alias needs qualified names.
+	auto left_cols = GetSubstraitRelColumnNames(sjoin.left());
+	auto right_cols = GetSubstraitRelColumnNames(sjoin.right());
+	if (!left_cols.empty() && !right_cols.empty()) {
+		RewriteJoinCondition(join_condition, left_cols, right_cols);
+	}
+
 	return make_shared_ptr<JoinRelation>(TransformOp(sjoin.left())->Alias("left"),
 	                                     TransformOp(sjoin.right())->Alias("right"), std::move(join_condition),
 	                                     djointype);
@@ -699,12 +763,25 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformAggregateOp(const substrait::Re
 		auto &s_aggr_function = smeas.measure();
 		bool is_distinct = s_aggr_function.invocation() ==
 		                   substrait::AggregateFunction_AggregationInvocation_AGGREGATION_INVOCATION_DISTINCT;
+		auto phase = s_aggr_function.phase();
+		bool is_finalize = (phase == substrait::AGGREGATION_PHASE_INTERMEDIATE_TO_RESULT);
 		for (auto &sarg : s_aggr_function.arguments()) {
 			children.push_back(TransformExpr(sarg.value()));
 		}
 		auto function_name = FindFunction(s_aggr_function.function_reference());
 		if (function_name == "count" && children.empty()) {
 			function_name = "count_star";
+		}
+		// For finalize phase (INTERMEDIATE_TO_RESULT), rewrite aggregate functions
+		// to merge partial results instead of re-running the original aggregation.
+		// count/count_star → sum (sum partial counts), sum → sum, min → min, max → max.
+		if (is_finalize) {
+			if (function_name == "count_star" || function_name == "count") {
+				// Partial count values need to be summed, not re-counted.
+				// The input is the partial count column, passed as an argument.
+				function_name = "sum";
+			}
+			// sum, min, max, avg are idempotent merge functions (sum of sums, etc.)
 		}
 		expressions.push_back(make_uniq<FunctionExpression>(RemapFunctionName(function_name), std::move(children),
 		                                                    nullptr, nullptr, is_distinct));
