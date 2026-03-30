@@ -475,10 +475,12 @@ unique_ptr<ParsedExpression> SubstraitToDuckDB::TransformExpr(const substrait::E
 	case substrait::Expression::RexTypeCase::kNested:
 		return TransformNested(sexpr, iterator);
 	case substrait::Expression::RexTypeCase::kSubquery:
-	default:
+	default: {
+		auto *field = substrait::Expression::GetDescriptor()->FindFieldByNumber(sexpr.rex_type_case());
 		throw NotImplementedException(
-		    "Unsupported expression type %s",
-		    substrait::Expression::GetDescriptor()->FindFieldByNumber(sexpr.rex_type_case())->name());
+		    "Unsupported expression type %s (rex_type_case=%d)",
+		    field ? field->name() : "UNKNOWN", static_cast<int>(sexpr.rex_type_case()));
+	}
 	}
 }
 
@@ -597,20 +599,33 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformJoinOp(const substrait::Rel &so
 		djointype = JoinType::OUTER;
 		break;
 	default:
-		throw NotImplementedException("Unsupported join type: %s",
-		                              substrait::JoinRel::GetDescriptor()->FindFieldByNumber(sjoin.type())->name());
+		throw NotImplementedException("Unsupported join type: %d", static_cast<int>(sjoin.type()));
 	}
-	unique_ptr<ParsedExpression> join_condition = TransformExpr(sjoin.expression());
+	unique_ptr<ParsedExpression> join_condition;
+	if (sjoin.has_expression()) {
+		try {
+			join_condition = TransformExpr(sjoin.expression());
+		} catch (std::exception &e) {
+			throw InvalidInputException("TransformJoinOp: failed to transform join expression: %s", e.what());
+		}
+	}
 
 	// Rewrite positional references in the join condition into named column
 	// references (left.col / right.col).  Substrait uses combined-schema
 	// field indices, but DuckDB JoinRelation with Alias needs qualified names.
-	auto left_cols = GetSubstraitRelColumnNames(sjoin.left());
-	auto right_cols = GetSubstraitRelColumnNames(sjoin.right());
-	if (!left_cols.empty() && !right_cols.empty()) {
-		RewriteJoinCondition(join_condition, left_cols, right_cols);
+	if (join_condition) {
+		auto left_cols = GetSubstraitRelColumnNames(sjoin.left());
+		auto right_cols = GetSubstraitRelColumnNames(sjoin.right());
+		if (!left_cols.empty() && !right_cols.empty()) {
+			RewriteJoinCondition(join_condition, left_cols, right_cols);
+		}
 	}
 
+	if (!join_condition) {
+		// No join condition → cross product (DuckDB JoinRelation requires a non-null condition).
+		return make_shared_ptr<CrossProductRelation>(TransformOp(sjoin.left())->Alias("left"),
+		                                             TransformOp(sjoin.right())->Alias("right"));
+	}
 	return make_shared_ptr<JoinRelation>(TransformOp(sjoin.left())->Alias("left"),
 	                                     TransformOp(sjoin.right())->Alias("right"), std::move(join_condition),
 	                                     djointype);
