@@ -542,6 +542,25 @@ static vector<string> GetSubstraitRelColumnNames(const substrait::Rel &rel) {
 	case substrait::Rel::RelTypeCase::kProject:
 		names = GetSubstraitRelColumnNames(rel.project().input());
 		break;
+	case substrait::Rel::RelTypeCase::kJoin: {
+		auto left_names = GetSubstraitRelColumnNames(rel.join().left());
+		auto right_names = GetSubstraitRelColumnNames(rel.join().right());
+		names.insert(names.end(), left_names.begin(), left_names.end());
+		names.insert(names.end(), right_names.begin(), right_names.end());
+		break;
+	}
+	case substrait::Rel::RelTypeCase::kCross: {
+		auto left_names = GetSubstraitRelColumnNames(rel.cross().left());
+		auto right_names = GetSubstraitRelColumnNames(rel.cross().right());
+		names.insert(names.end(), left_names.begin(), left_names.end());
+		names.insert(names.end(), right_names.begin(), right_names.end());
+		break;
+	}
+	// NOTE: kAggregate deliberately omitted — output columns differ from input columns.
+	// When a join has an AGG child, positional references are kept as-is.
+	case substrait::Rel::RelTypeCase::kFetch:
+		names = GetSubstraitRelColumnNames(rel.fetch().input());
+		break;
 	default:
 		break;
 	}
@@ -610,6 +629,20 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformJoinOp(const substrait::Rel &so
 	default:
 		throw NotImplementedException("Unsupported join type: %d", static_cast<int>(sjoin.type()));
 	}
+	// Transform children first so we can use their Columns() for name resolution.
+	auto left_rel = TransformOp(sjoin.left())->Alias("left");
+	auto right_rel = TransformOp(sjoin.right())->Alias("right");
+
+	// Collect column names from the actual DuckDB Relations (always accurate,
+	// unlike GetSubstraitRelColumnNames which can't handle all Rel types).
+	vector<string> left_cols, right_cols;
+	for (auto &col : left_rel->Columns()) {
+		left_cols.push_back(col.GetName());
+	}
+	for (auto &col : right_rel->Columns()) {
+		right_cols.push_back(col.GetName());
+	}
+
 	unique_ptr<ParsedExpression> join_condition;
 	if (sjoin.has_expression()) {
 		try {
@@ -622,12 +655,8 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformJoinOp(const substrait::Rel &so
 	// Rewrite positional references in the join condition into named column
 	// references (left.col / right.col).  Substrait uses combined-schema
 	// field indices, but DuckDB JoinRelation with Alias needs qualified names.
-	if (join_condition) {
-		auto left_cols = GetSubstraitRelColumnNames(sjoin.left());
-		auto right_cols = GetSubstraitRelColumnNames(sjoin.right());
-		if (!left_cols.empty() && !right_cols.empty()) {
-			RewriteJoinCondition(join_condition, left_cols, right_cols);
-		}
+	if (join_condition && !left_cols.empty() && !right_cols.empty()) {
+		RewriteJoinCondition(join_condition, left_cols, right_cols);
 	}
 
 	// Merge post_join_filter into the join condition.
@@ -637,8 +666,6 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformJoinOp(const substrait::Rel &so
 		try {
 			auto post_filter = TransformExpr(sjoin.post_join_filter());
 			if (post_filter) {
-				auto left_cols = GetSubstraitRelColumnNames(sjoin.left());
-				auto right_cols = GetSubstraitRelColumnNames(sjoin.right());
 				if (!left_cols.empty() && !right_cols.empty()) {
 					RewriteJoinCondition(post_filter, left_cols, right_cols);
 				}
@@ -656,13 +683,10 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformJoinOp(const substrait::Rel &so
 	}
 
 	if (!join_condition) {
-		// No join condition → cross product (DuckDB JoinRelation requires a non-null condition).
-		return make_shared_ptr<CrossProductRelation>(TransformOp(sjoin.left())->Alias("left"),
-		                                             TransformOp(sjoin.right())->Alias("right"));
+		return make_shared_ptr<CrossProductRelation>(std::move(left_rel), std::move(right_rel));
 	}
-	return make_shared_ptr<JoinRelation>(TransformOp(sjoin.left())->Alias("left"),
-	                                     TransformOp(sjoin.right())->Alias("right"), std::move(join_condition),
-	                                     djointype);
+	return make_shared_ptr<JoinRelation>(std::move(left_rel), std::move(right_rel),
+	                                     std::move(join_condition), djointype);
 }
 
 shared_ptr<Relation> SubstraitToDuckDB::TransformCrossProductOp(const substrait::Rel &sop) {
