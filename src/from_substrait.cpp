@@ -598,6 +598,15 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformJoinOp(const substrait::Rel &so
 	case substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_OUTER:
 		djointype = JoinType::OUTER;
 		break;
+	case substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_LEFT_ANTI:
+		djointype = JoinType::ANTI;
+		break;
+	case substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_RIGHT_SEMI:
+		djointype = JoinType::RIGHT_SEMI;
+		break;
+	case substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_RIGHT_ANTI:
+		djointype = JoinType::RIGHT_ANTI;
+		break;
 	default:
 		throw NotImplementedException("Unsupported join type: %d", static_cast<int>(sjoin.type()));
 	}
@@ -618,6 +627,31 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformJoinOp(const substrait::Rel &so
 		auto right_cols = GetSubstraitRelColumnNames(sjoin.right());
 		if (!left_cols.empty() && !right_cols.empty()) {
 			RewriteJoinCondition(join_condition, left_cols, right_cols);
+		}
+	}
+
+	// Merge post_join_filter into the join condition.
+	// Substrait separates these, but DuckDB's JoinRelation uses a single condition.
+	// Combining with AND is semantically correct for all join types.
+	if (sjoin.has_post_join_filter()) {
+		try {
+			auto post_filter = TransformExpr(sjoin.post_join_filter());
+			if (post_filter) {
+				auto left_cols = GetSubstraitRelColumnNames(sjoin.left());
+				auto right_cols = GetSubstraitRelColumnNames(sjoin.right());
+				if (!left_cols.empty() && !right_cols.empty()) {
+					RewriteJoinCondition(post_filter, left_cols, right_cols);
+				}
+				if (join_condition) {
+					join_condition = make_uniq<ConjunctionExpression>(
+					    ExpressionType::CONJUNCTION_AND,
+					    std::move(join_condition), std::move(post_filter));
+				} else {
+					join_condition = std::move(post_filter);
+				}
+			}
+		} catch (std::exception &e) {
+			throw InvalidInputException("TransformJoinOp: failed to transform post_join_filter: %s", e.what());
 		}
 	}
 
