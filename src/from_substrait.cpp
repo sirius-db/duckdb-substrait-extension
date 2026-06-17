@@ -1,6 +1,7 @@
 #include "from_substrait.hpp"
 
 #include <cinttypes>
+#include <cmath>
 
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/parser/expression/list.hpp"
@@ -154,8 +155,8 @@ Value TransformLiteralToValue(const substrait::Expression_Literal &literal) {
 		date_t date(literal.date());
 		return Value::DATE(date);
 	}
-	case substrait::Expression_Literal::LiteralTypeCase::kTime: {
-		dtime_t time(literal.time());
+	case substrait::Expression_Literal::LiteralTypeCase::kPrecisionTime: {
+		dtime_t time(literal.precision_time().value());
 		return Value::TIME(time);
 	}
 	case substrait::Expression_Literal::LiteralTypeCase::kIntervalYearToMonth: {
@@ -169,7 +170,19 @@ Value TransformLiteralToValue(const substrait::Expression_Literal &literal) {
 		interval_t interval {};
 		interval.months = 0;
 		interval.days = literal.interval_day_to_second().days();
-		interval.micros = literal.interval_day_to_second().microseconds();
+		// Convert seconds to microseconds and add subseconds (with precision adjustment)
+		int64_t seconds_in_micros = literal.interval_day_to_second().seconds() * Interval::MICROS_PER_SEC;
+		int64_t subseconds = literal.interval_day_to_second().subseconds();
+		int32_t precision = literal.interval_day_to_second().precision();
+		// Adjust subseconds based on precision (e.g., precision 9 = nanoseconds, need to convert to microseconds)
+		if (precision > 6) {
+			// Convert from higher precision (e.g., nanoseconds) to microseconds
+			subseconds = subseconds / (int64_t)pow(10, precision - 6);
+		} else if (precision < 6) {
+			// Convert from lower precision (e.g., milliseconds) to microseconds
+			subseconds = subseconds * (int64_t)pow(10, 6 - precision);
+		}
+		interval.micros = seconds_in_micros + subseconds;
 		return Value::INTERVAL(interval);
 	}
 	case substrait::Expression_Literal::LiteralTypeCase::kVarChar:
@@ -279,6 +292,11 @@ unique_ptr<ParsedExpression> SubstraitToDuckDB::TransformScalarFunctionExpr(cons
 	} else if (function_name == "between") {
 		D_ASSERT(children.size() == 3);
 		return make_uniq<BetweenExpression>(std::move(children[0]), std::move(children[1]), std::move(children[2]));
+	} else if (function_name == "coalesce") {
+		// COALESCE is a variadic function that returns the first non-NULL value
+		// Convert to DuckDB's OPERATOR_COALESCE
+		D_ASSERT(children.size() >= 1);
+		return make_uniq<OperatorExpression>(ExpressionType::OPERATOR_COALESCE, std::move(children));
 	} else if (function_name == "extract") {
 		D_ASSERT(enum_expressions.size() == 1);
 		auto &subfield = enum_expressions[0];
@@ -321,7 +339,7 @@ LogicalType SubstraitToDuckDB::SubstraitToDuckType(const substrait::Type &s_type
 	}
 	case substrait::Type::KindCase::kDate:
 		return {LogicalTypeId::DATE};
-	case substrait::Type::KindCase::kTime:
+	case substrait::Type::KindCase::kPrecisionTime:
 		return {LogicalTypeId::TIME};
 	case substrait::Type::KindCase::kVarchar:
 	case substrait::Type::KindCase::kString:
@@ -332,8 +350,6 @@ LogicalType SubstraitToDuckDB::SubstraitToDuckType(const substrait::Type &s_type
 		return {LogicalTypeId::FLOAT};
 	case substrait::Type::KindCase::kFp64:
 		return {LogicalTypeId::DOUBLE};
-	case substrait::Type::KindCase::kTimestamp:
-		return {LogicalTypeId::TIMESTAMP};
 	case substrait::Type::KindCase::kPrecisionTimestamp: {
 		auto &s_precision_timestamp = s_type.precision_timestamp();
 		auto precision = s_precision_timestamp.precision();
@@ -539,6 +555,12 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformJoinOp(const substrait::Rel &so
 	case substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_LEFT_SEMI:
 		djointype = JoinType::SEMI;
 		break;
+	case substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_RIGHT_SEMI:
+		djointype = JoinType::RIGHT_SEMI;
+		break;
+	case substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_LEFT_MARK:
+		djointype = JoinType::MARK;
+		break;
 	case substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_OUTER:
 		djointype = JoinType::OUTER;
 		break;
@@ -683,14 +705,34 @@ SubstraitToDuckDB::TransformProjectOp(const substrait::Rel &sop,
 }
 
 shared_ptr<Relation> SubstraitToDuckDB::TransformAggregateOp(const substrait::Rel &sop) {
-	vector<unique_ptr<ParsedExpression>> groups, expressions;
+	vector<unique_ptr<ParsedExpression>> expressions;
+	GroupByNode group_node;
+
+	auto input_rel = TransformOp(sop.aggregate().input());
 
 	if (sop.aggregate().groupings_size() > 0) {
-		for (auto &sgrp : sop.aggregate().groupings()) {
-			for (auto &sgrpexpr : sgrp.grouping_expressions()) {
-				groups.push_back(TransformExpr(sgrpexpr));
-				expressions.push_back(TransformExpr(sgrpexpr));
+		// First, add ALL grouping expressions to the GroupByNode
+		for (int i = 0; i < sop.aggregate().grouping_expressions_size(); i++) {
+			auto expr = TransformExpr(sop.aggregate().grouping_expressions(i));
+			// Add to output expressions
+			expressions.push_back(expr->Copy());
+			// Add to group_node
+			group_node.group_expressions.push_back(std::move(expr));
+		}
+		
+		// Now convert each Substrait grouping to a DuckDB grouping set
+		for (int g = 0; g < sop.aggregate().groupings_size(); g++) {
+			auto &sgrp = sop.aggregate().groupings(g);
+			GroupingSet grouping_set;
+			// expression_references contains indices into the grouping_expressions array
+			for (auto ref_idx : sgrp.expression_references()) {
+				if (ref_idx < (uint32_t)sop.aggregate().grouping_expressions_size()) {
+					grouping_set.insert(ref_idx);
+				} else {
+					throw InternalException("Invalid expression reference index in grouping");
+				}
 			}
+			group_node.grouping_sets.push_back(grouping_set);
 		}
 	}
 
@@ -699,19 +741,46 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformAggregateOp(const substrait::Re
 		auto &s_aggr_function = smeas.measure();
 		bool is_distinct = s_aggr_function.invocation() ==
 		                   substrait::AggregateFunction_AggregationInvocation_AGGREGATION_INVOCATION_DISTINCT;
-		for (auto &sarg : s_aggr_function.arguments()) {
-			children.push_back(TransformExpr(sarg.value()));
-		}
 		auto function_name = FindFunction(s_aggr_function.function_reference());
-		if (function_name == "count" && children.empty()) {
-			function_name = "count_star";
+		
+		// Special handling for GROUPING() function
+		// GROUPING() is not a regular aggregate function - it's a special operator
+		if (function_name == "grouping") {
+			// For GROUPING(), the arguments are field references to grouping columns
+			// We need to resolve these to copies of the actual grouping expressions
+			for (auto &sarg : s_aggr_function.arguments()) {
+				auto arg_expr = TransformExpr(sarg.value());
+				// Check if this is a positional reference
+				if (arg_expr->GetExpressionClass() == ExpressionClass::POSITIONAL_REFERENCE) {
+					auto &pos_ref = arg_expr->Cast<PositionalReferenceExpression>();
+					// The position is 1-based, convert to 0-based index
+					idx_t group_idx = pos_ref.index - 1;
+					// Get the corresponding grouping expression and make a copy
+					if (group_idx < group_node.group_expressions.size()) {
+						children.push_back(group_node.group_expressions[group_idx]->Copy());
+					} else {
+						throw InternalException("GROUPING function references invalid grouping column index");
+					}
+				} else {
+					// If it's not a positional reference, use it as-is
+					children.push_back(std::move(arg_expr));
+				}
+			}
+			// Create an OperatorExpression with GROUPING_FUNCTION type
+			expressions.push_back(make_uniq<OperatorExpression>(ExpressionType::GROUPING_FUNCTION, std::move(children)));
+		} else {
+			for (auto &sarg : s_aggr_function.arguments()) {
+				children.push_back(TransformExpr(sarg.value()));
+			}
+			if (function_name == "count" && children.empty()) {
+				function_name = "count_star";
+			}
+			expressions.push_back(make_uniq<FunctionExpression>(RemapFunctionName(function_name), std::move(children),
+			                                                    nullptr, nullptr, is_distinct));
 		}
-		expressions.push_back(make_uniq<FunctionExpression>(RemapFunctionName(function_name), std::move(children),
-		                                                    nullptr, nullptr, is_distinct));
 	}
 
-	return make_shared_ptr<AggregateRelation>(TransformOp(sop.aggregate().input()), std::move(expressions),
-	                                          std::move(groups));
+	return make_shared_ptr<AggregateRelation>(input_rel, std::move(expressions), std::move(group_node));
 }
 unique_ptr<TableDescription> TableInfo(ClientContext &context, const string &schema_name, const string &table_name) {
 	// obtain the table info
@@ -805,8 +874,49 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformReadOp(const substrait::Rel &so
 			} else {
 				scan = make_shared_ptr<ValueRelation>(context_wrapper, expression_rows, column_names);
 			}
-		} else {
+		} else if (!sget.virtual_table().expressions().empty()) {
 			scan = GetValuesExpression(sget.virtual_table().expressions());
+		} else if (sget.has_base_schema() && sget.base_schema().names_size() > 0 && sget.base_schema().struct_().types_size() > 0) {
+			// Empty virtual table represents an empty result (EMPTY_RESULT operator)
+			// Extract schema from base_schema
+			vector<string> column_names;
+			vector<LogicalType> column_types;
+
+			auto &base_schema = sget.base_schema();
+			auto &struct_type = base_schema.struct_();
+
+			// Extract column names and types from base_schema
+			for (int i = 0; i < base_schema.names_size() && i < struct_type.types_size(); i++) {
+				column_names.push_back(base_schema.names(i));
+				column_types.push_back(SubstraitToDuckType(struct_type.types(i)));
+			}
+
+			// Create a ValueRelation with one row of NULLs to preserve schema, then filter with FALSE to get 0 rows
+			// Using Filter with FALSE ensures the row is eliminated before any aggregations
+			vector<vector<Value>> one_null_row;
+			vector<Value> null_values;
+			for (auto &type : column_types) {
+				null_values.push_back(Value(type));
+			}
+			one_null_row.push_back(null_values);
+
+			shared_ptr<Relation> values_rel;
+			if (acquire_lock) {
+				values_rel = make_shared_ptr<ValueRelation>(context, one_null_row, column_names);
+			} else {
+				values_rel = make_shared_ptr<ValueRelation>(context_wrapper, one_null_row, column_names);
+			}
+			// Filter with 1=0 to get empty result with schema (eliminates row before aggregation)
+			scan = values_rel->Filter("1=0");
+		} else {
+			// Fallback: empty result with no schema
+			vector<vector<Value>> empty_rows;
+			vector<string> column_names;
+			if (acquire_lock) {
+				scan = make_shared_ptr<ValueRelation>(context, empty_rows, column_names);
+			} else {
+				scan = make_shared_ptr<ValueRelation>(context_wrapper, empty_rows, column_names);
+			}
 		}
 	} else if (sget.has_iceberg_table()) {
 		if (sget.iceberg_table().direct().metadata_uri().empty()) {
@@ -838,6 +948,39 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformReadOp(const substrait::Rel &so
 		scan = rel->Alias(name);
 	} else {
 		throw NotImplementedException("Unsupported type of read operator for substrait");
+	}
+
+	// When a named table's physical schema has more columns than the plan's
+	// baseSchema declares, add a projection to narrow down to only the declared
+	// columns. Without this, downstream emit mappings (which assume baseSchema
+	// column count) compute wrong expression indices.
+	if (sget.has_named_table() && sget.has_base_schema() && !sget.has_projection()) {
+		auto &base_schema = sget.base_schema();
+		auto physical_cols = scan->Columns().size();
+		auto declared_cols = (size_t)base_schema.names_size();
+		if (declared_cols > 0 && declared_cols < physical_cols) {
+			// Match baseSchema column names to physical column positions
+			vector<unique_ptr<ParsedExpression>> proj_exprs;
+			vector<string> proj_aliases;
+			auto &scan_columns = scan->Columns();
+			for (int i = 0; i < base_schema.names_size(); i++) {
+				auto &col_name = base_schema.names(i);
+				bool found = false;
+				for (size_t j = 0; j < scan_columns.size(); j++) {
+					if (StringUtil::CIEquals(scan_columns[j].Name(), col_name)) {
+						proj_exprs.push_back(make_uniq<PositionalReferenceExpression>(j + 1));
+						proj_aliases.push_back(col_name);
+						found = true;
+						break;
+					}
+				}
+				if (!found) {
+					throw InvalidInputException(
+					    "baseSchema column '%s' not found in physical table (schema mismatch)", col_name);
+				}
+			}
+			scan = make_shared_ptr<ProjectionRelation>(std::move(scan), std::move(proj_exprs), std::move(proj_aliases));
+		}
 	}
 
 	if (sget.has_filter()) {
@@ -905,6 +1048,125 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformSortOp(const substrait::Rel &so
 		order_nodes.push_back(TransformOrder(sordf));
 	}
 	return make_shared_ptr<OrderRelation>(TransformOp(sop.sort().input(), names), std::move(order_nodes));
+}
+
+shared_ptr<Relation> SubstraitToDuckDB::TransformWindowOp(const substrait::Rel &sop) {
+	// Get the input relation
+	auto input_rel = TransformOp(sop.window().input());
+	
+	// Build window expressions from the window functions
+	vector<unique_ptr<ParsedExpression>> expressions;
+	vector<string> aliases;
+	
+	// First, add all input columns to preserve them in the output
+	auto num_input_columns = input_rel->Columns().size();
+	for (size_t i = 0; i < num_input_columns; i++) {
+		expressions.push_back(make_uniq<PositionalReferenceExpression>(i + 1));
+		aliases.push_back(""); // Empty alias, DuckDB will use the original column name
+	}
+	
+	// Then add the window function expressions
+	for (auto &window_func : sop.window().window_functions()) {
+		// Get the function name
+		auto function_name = FindFunction(window_func.function_reference());
+		auto remapped_name = RemapFunctionName(function_name);
+		
+		// Determine the expression type based on the function name
+		ExpressionType expr_type;
+		if (remapped_name == "row_number") {
+			expr_type = ExpressionType::WINDOW_ROW_NUMBER;
+		} else if (remapped_name == "rank") {
+			expr_type = ExpressionType::WINDOW_RANK;
+		} else if (remapped_name == "dense_rank") {
+			expr_type = ExpressionType::WINDOW_RANK_DENSE;
+		} else if (remapped_name == "percent_rank") {
+			expr_type = ExpressionType::WINDOW_PERCENT_RANK;
+		} else if (remapped_name == "cume_dist") {
+			expr_type = ExpressionType::WINDOW_CUME_DIST;
+		} else if (remapped_name == "ntile") {
+			expr_type = ExpressionType::WINDOW_NTILE;
+		} else if (remapped_name == "lag") {
+			expr_type = ExpressionType::WINDOW_LAG;
+		} else if (remapped_name == "lead") {
+			expr_type = ExpressionType::WINDOW_LEAD;
+		} else if (remapped_name == "first_value") {
+			expr_type = ExpressionType::WINDOW_FIRST_VALUE;
+		} else if (remapped_name == "last_value") {
+			expr_type = ExpressionType::WINDOW_LAST_VALUE;
+		} else if (remapped_name == "nth_value") {
+			expr_type = ExpressionType::WINDOW_NTH_VALUE;
+		} else {
+			// Default to WINDOW_AGGREGATE for aggregate functions used as window functions
+			expr_type = ExpressionType::WINDOW_AGGREGATE;
+		}
+		
+		// Create window expression
+		auto window_expr = make_uniq<WindowExpression>(expr_type, "", "", remapped_name);
+		
+		// Add function arguments
+		for (auto &arg : window_func.arguments()) {
+			window_expr->children.push_back(TransformExpr(arg.value()));
+		}
+		
+		// Add partition expressions
+		for (auto &partition_expr : sop.window().partition_expressions()) {
+			window_expr->partitions.push_back(TransformExpr(partition_expr));
+		}
+		
+		// Add order by expressions
+		for (auto &sort_field : sop.window().sorts()) {
+			window_expr->orders.push_back(TransformOrder(sort_field));
+		}
+		
+		// Handle window bounds
+		if (window_func.has_lower_bound() || window_func.has_upper_bound()) {
+			// Determine bounds type (ROWS or RANGE)
+			bool is_rows = window_func.bounds_type() == substrait::Expression_WindowFunction_BoundsType_BOUNDS_TYPE_ROWS;
+			
+			// Transform lower bound
+			if (window_func.has_lower_bound()) {
+				auto &lower = window_func.lower_bound();
+				if (lower.has_unbounded()) {
+					window_expr->start = WindowBoundary::UNBOUNDED_PRECEDING;
+				} else if (lower.has_current_row()) {
+					window_expr->start = is_rows ? WindowBoundary::CURRENT_ROW_ROWS : WindowBoundary::CURRENT_ROW_RANGE;
+				} else if (lower.has_preceding()) {
+					window_expr->start_expr = make_uniq<ConstantExpression>(Value::BIGINT(lower.preceding().offset()));
+					window_expr->start = is_rows ? WindowBoundary::EXPR_PRECEDING_ROWS : WindowBoundary::EXPR_PRECEDING_RANGE;
+				} else if (lower.has_following()) {
+					window_expr->start_expr = make_uniq<ConstantExpression>(Value::BIGINT(lower.following().offset()));
+					window_expr->start = is_rows ? WindowBoundary::EXPR_FOLLOWING_ROWS : WindowBoundary::EXPR_FOLLOWING_RANGE;
+				}
+			}
+			
+			// Transform upper bound
+			if (window_func.has_upper_bound()) {
+				auto &upper = window_func.upper_bound();
+				if (upper.has_unbounded()) {
+					window_expr->end = WindowBoundary::UNBOUNDED_FOLLOWING;
+				} else if (upper.has_current_row()) {
+					window_expr->end = is_rows ? WindowBoundary::CURRENT_ROW_ROWS : WindowBoundary::CURRENT_ROW_RANGE;
+				} else if (upper.has_preceding()) {
+					window_expr->end_expr = make_uniq<ConstantExpression>(Value::BIGINT(upper.preceding().offset()));
+					window_expr->end = is_rows ? WindowBoundary::EXPR_PRECEDING_ROWS : WindowBoundary::EXPR_PRECEDING_RANGE;
+				} else if (upper.has_following()) {
+					window_expr->end_expr = make_uniq<ConstantExpression>(Value::BIGINT(upper.following().offset()));
+					window_expr->end = is_rows ? WindowBoundary::EXPR_FOLLOWING_ROWS : WindowBoundary::EXPR_FOLLOWING_RANGE;
+				}
+			}
+		}
+		
+		// Handle invocation (DISTINCT, etc.)
+		window_expr->distinct =
+			window_func.invocation() == substrait::AggregateFunction_AggregationInvocation_AGGREGATION_INVOCATION_DISTINCT;
+		
+		expressions.push_back(std::move(window_expr));
+		aliases.push_back(""); // Empty alias, DuckDB will generate one
+	}
+	
+	// Return a projection with the window expressions
+	// Window functions in DuckDB are handled as projections with window expressions
+	return input_rel->Project(std::move(expressions), aliases);
 }
 
 static SetOperationType TransformSetOperationType(substrait::SetRel_SetOp setop) {
@@ -1016,6 +1278,8 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformOp(const substrait::Rel &sop,
 		return TransformReadOp(sop);
 	case substrait::Rel::RelTypeCase::kSort:
 		return TransformSortOp(sop, names);
+	case substrait::Rel::RelTypeCase::kWindow:
+		return TransformWindowOp(sop);
 	case substrait::Rel::RelTypeCase::kSet:
 		return TransformSetOp(sop, names);
 	case substrait::Rel::RelTypeCase::kWrite:

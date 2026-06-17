@@ -183,7 +183,9 @@ void DuckDBToSubstrait::TransformDate(const Value &dval, substrait::Expression &
 
 void DuckDBToSubstrait::TransformTime(const Value &dval, substrait::Expression &sexpr) {
 	auto &sval = *sexpr.mutable_literal();
-	sval.set_time(dval.GetValue<dtime_t>().micros);
+	auto precision_time = sval.mutable_precision_time();
+	precision_time->set_precision(6); // microseconds
+	precision_time->set_value(dval.GetValue<dtime_t>().micros);
 }
 
 void DuckDBToSubstrait::TransformTimestamp(const Value &dval, substrait::Expression &sexpr) {
@@ -205,7 +207,8 @@ void DuckDBToSubstrait::TransformInterval(const Value &dval, substrait::Expressi
 	} else {
 		auto interval_day = make_uniq<substrait::Expression_Literal_IntervalDayToSecond>();
 		interval_day->set_days(dval.GetValue<interval_t>().days);
-		interval_day->set_microseconds(static_cast<int32_t>(dval.GetValue<interval_t>().micros));
+		interval_day->set_subseconds(dval.GetValue<interval_t>().micros);
+		interval_day->set_precision(6); // microseconds precision
 		sval.set_allocated_interval_day_to_second(interval_day.release());
 	}
 }
@@ -541,6 +544,23 @@ void DuckDBToSubstrait::TransformNotExpression(Expression &dexpr, substrait::Exp
 	*scalar_fun->mutable_output_type() = DuckToSubstraitType(dop.return_type);
 }
 
+void DuckDBToSubstrait::TransformCoalesceExpression(Expression &dexpr, substrait::Expression &sexpr,
+                                                     uint64_t col_offset) {
+	auto &dop = dexpr.Cast<BoundOperatorExpression>();
+	auto scalar_fun = sexpr.mutable_scalar_function();
+	vector<::substrait::Type> args_types;
+	
+	// COALESCE is variadic - add all children as arguments
+	for (auto &child : dop.children) {
+		auto s_arg = scalar_fun->add_arguments();
+		TransformExpr(*child, *s_arg->mutable_value(), col_offset);
+		args_types.emplace_back(DuckToSubstraitType(child->return_type));
+	}
+	
+	scalar_fun->set_function_reference(RegisterFunction("coalesce", args_types));
+	*scalar_fun->mutable_output_type() = DuckToSubstraitType(dop.return_type);
+}
+
 void DuckDBToSubstrait::TransformExpr(Expression &dexpr, substrait::Expression &sexpr, uint64_t col_offset) {
 	switch (dexpr.type) {
 	case ExpressionType::BOUND_REF:
@@ -586,6 +606,9 @@ void DuckDBToSubstrait::TransformExpr(Expression &dexpr, substrait::Expression &
 	case ExpressionType::OPERATOR_NOT:
 		TransformNotExpression(dexpr, sexpr, col_offset);
 		break;
+	case ExpressionType::OPERATOR_COALESCE:
+		TransformCoalesceExpression(dexpr, sexpr, col_offset);
+		break;
 	default:
 		throw NotImplementedException(ExpressionTypeToString(dexpr.type));
 	}
@@ -596,20 +619,18 @@ uint64_t DuckDBToSubstrait::RegisterFunction(const string &name, vector<::substr
 		throw InternalException("Missing function name");
 	}
 	auto function = custom_functions.Get(name, args_types);
-	auto substrait_extensions = plan.mutable_extension_uris();
+	auto substrait_extensions = plan.mutable_extension_urns();
 	if (!function.IsNative()) {
-		auto extensionURI = function.GetExtensionURI();
-		auto it = extension_uri_map.find(extensionURI);
-		if (it == extension_uri_map.end()) {
+		auto extensionURN = function.GetExtensionURN();
+		auto it = extension_urn_map.find(extensionURN);
+		if (it == extension_urn_map.end()) {
 			// We have to add this extension
-			extension_uri_map[extensionURI] = last_uri_id;
-			auto allocated_string = new string();
-			*allocated_string = extensionURI;
-			auto uri = new substrait::extensions::SimpleExtensionURI();
-			uri->set_allocated_uri(allocated_string);
-			uri->set_extension_uri_anchor(last_uri_id);
-			substrait_extensions->AddAllocated(uri);
-			last_uri_id++;
+			extension_urn_map[extensionURN] = last_urn_id;
+			auto urn = new substrait::extensions::SimpleExtensionURN();
+			urn->set_urn(extensionURN);
+			urn->set_extension_urn_anchor(last_urn_id);
+			substrait_extensions->AddAllocated(urn);
+			last_urn_id++;
 		}
 	}
 	if (functions_map.find(function.function.GetName()) == functions_map.end()) {
@@ -618,11 +639,11 @@ uint64_t DuckDBToSubstrait::RegisterFunction(const string &name, vector<::substr
 		sfun->set_function_anchor(function_id);
 		sfun->set_name(function.function.GetName());
 		if (!function.IsNative()) {
-			// We only define URI if not native
-			sfun->set_extension_uri_reference(extension_uri_map[function.GetExtensionURI()]);
+			// We only define URN if not native
+			sfun->set_extension_urn_reference(extension_urn_map[function.GetExtensionURN()]);
 		} else {
 			// Function was not found in the yaml files
-			sfun->set_extension_uri_reference(0);
+			sfun->set_extension_urn_reference(0);
 			if (strict) {
 				// Produce warning message
 				std::ostringstream error;
@@ -856,6 +877,9 @@ substrait::Expression *DuckDBToSubstrait::TransformJoinCond(const JoinCondition 
 	switch (dcond.comparison) {
 	case ExpressionType::COMPARE_EQUAL:
 		join_comparision = "equal";
+		break;
+	case ExpressionType::COMPARE_NOTEQUAL:
+		join_comparision = "not_equal";
 		break;
 	case ExpressionType::COMPARE_GREATERTHAN:
 		join_comparision = "gt";
@@ -1146,20 +1170,86 @@ substrait::Rel *DuckDBToSubstrait::TransformComparisonJoin(LogicalOperator &dop)
 	auto res = new substrait::Rel();
 	auto sjoin = res->mutable_join();
 	auto &djoin = dop.Cast<LogicalComparisonJoin>();
-	sjoin->set_allocated_left(TransformOp(*dop.children[0]));
-	sjoin->set_allocated_right(TransformOp(*dop.children[1]));
+	
+	// RIGHT_SEMI is equivalent to LEFT_SEMI with swapped children
+	bool is_right_semi = djoin.join_type == JoinType::RIGHT_SEMI;
+	idx_t left_child_idx = is_right_semi ? 1 : 0;
+	idx_t right_child_idx = is_right_semi ? 0 : 1;
+	
+	sjoin->set_allocated_left(TransformOp(*dop.children[left_child_idx]));
+	sjoin->set_allocated_right(TransformOp(*dop.children[right_child_idx]));
 
-	auto left_col_count = dop.children[0]->types.size();
-	if (dop.children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-		auto &child_join = dop.children[0]->Cast<LogicalComparisonJoin>();
-		if (child_join.join_type != JoinType::SEMI && child_join.join_type != JoinType::ANTI) {
+	auto left_col_count = dop.children[left_child_idx]->types.size();
+	if (dop.children[left_child_idx]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto &child_join = dop.children[left_child_idx]->Cast<LogicalComparisonJoin>();
+		if (child_join.join_type != JoinType::SEMI && child_join.join_type != JoinType::ANTI && child_join.join_type != JoinType::RIGHT_SEMI) {
 			left_col_count = child_join.left_projection_map.size() + child_join.right_projection_map.size();
 		} else {
 			left_col_count = child_join.left_projection_map.size();
 		}
 	}
-	sjoin->set_allocated_expression(CreateConjunction(
-	    djoin.conditions, [&](const JoinCondition &in) { return TransformJoinCond(in, left_col_count); }));
+	
+	// For RIGHT_SEMI, we need to swap the column references in join conditions
+	auto right_col_count = dop.children[right_child_idx]->types.size();
+	if (is_right_semi) {
+		// For RIGHT_SEMI, swap left and right expressions in conditions
+		sjoin->set_allocated_expression(CreateConjunction(
+		    djoin.conditions, [&](const JoinCondition &in) {
+				// Create expression with swapped left/right
+				auto expr = new substrait::Expression();
+				string join_comparision;
+				switch (in.comparison) {
+				case ExpressionType::COMPARE_EQUAL:
+					join_comparision = "equal";
+					break;
+				case ExpressionType::COMPARE_NOTEQUAL:
+					join_comparision = "not_equal";
+					break;
+				case ExpressionType::COMPARE_GREATERTHAN:
+					// Swap: left > right becomes right < left
+					join_comparision = "lt";
+					break;
+				case ExpressionType::COMPARE_NOT_DISTINCT_FROM:
+					join_comparision = "is_not_distinct_from";
+					break;
+				case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+					// Swap: left >= right becomes right <= left
+					join_comparision = "lte";
+					break;
+				case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+					// Swap: left <= right becomes right >= left
+					join_comparision = "gte";
+					break;
+				case ExpressionType::COMPARE_LESSTHAN:
+					// Swap: left < right becomes right > left
+					join_comparision = "gt";
+					break;
+				default:
+					throw NotImplementedException("Unsupported join comparison: " + ExpressionTypeToOperator(in.comparison));
+				}
+				vector<::substrait::Type> args_types;
+				auto scalar_fun = expr->mutable_scalar_function();
+				
+				// Swap: right expression first (no offset)
+				auto s_arg = scalar_fun->add_arguments();
+				TransformExpr(*in.right, *s_arg->mutable_value());
+				args_types.emplace_back(DuckToSubstraitType(in.right->return_type));
+				
+				// Then left expression (with offset)
+				s_arg = scalar_fun->add_arguments();
+				TransformExpr(*in.left, *s_arg->mutable_value(), left_col_count);
+				args_types.emplace_back(DuckToSubstraitType(in.left->return_type));
+				
+				LogicalType bool_type = LogicalType::BOOLEAN;
+				*scalar_fun->mutable_output_type() = DuckToSubstraitType(bool_type);
+				scalar_fun->set_function_reference(RegisterFunction(join_comparision, args_types));
+				
+				return expr;
+			}));
+	} else {
+		sjoin->set_allocated_expression(CreateConjunction(
+		    djoin.conditions, [&](const JoinCondition &in) { return TransformJoinCond(in, left_col_count); }));
+	}
 
 	switch (djoin.join_type) {
 	case JoinType::INNER:
@@ -1176,6 +1266,13 @@ substrait::Rel *DuckDBToSubstrait::TransformComparisonJoin(LogicalOperator &dop)
 		break;
 	case JoinType::SEMI:
 		sjoin->set_type(substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_LEFT_SEMI);
+		break;
+	case JoinType::RIGHT_SEMI:
+		// Convert RIGHT_SEMI to LEFT_SEMI since we swapped the children
+		sjoin->set_type(substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_LEFT_SEMI);
+		break;
+	case JoinType::MARK:
+		sjoin->set_type(substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_LEFT_MARK);
 		break;
 	case JoinType::OUTER:
 		sjoin->set_type(substrait::JoinRel::JoinType::JoinRel_JoinType_JOIN_TYPE_OUTER);
@@ -1197,12 +1294,16 @@ substrait::Rel *DuckDBToSubstrait::TransformComparisonJoin(LogicalOperator &dop)
 	// TODO this projection seems redundant but from_substrait does not work without it
 	auto proj_rel = new substrait::Rel();
 	auto projection = proj_rel->mutable_project();
-	auto child_column_count = GetColumnCount(*dop.children[0]);
-	for (auto left_idx : djoin.left_projection_map) {
-		CreateFieldRef(projection->add_expressions(), left_idx);
+	auto child_column_count = GetColumnCount(*dop.children[left_child_idx]);
+	
+	// For RIGHT_SEMI (now converted to LEFT_SEMI with swapped children), use right_projection_map
+	// For SEMI, use left_projection_map
+	auto &projection_map = is_right_semi ? djoin.right_projection_map : djoin.left_projection_map;
+	for (auto idx : projection_map) {
+		CreateFieldRef(projection->add_expressions(), idx);
 	}
-	if (djoin.join_type != JoinType::SEMI) {
-		child_column_count += GetColumnCount(*dop.children[1]);
+	if (djoin.join_type != JoinType::SEMI && djoin.join_type != JoinType::RIGHT_SEMI) {
+		child_column_count += GetColumnCount(*dop.children[right_child_idx]);
 		for (auto right_idx : djoin.right_projection_map) {
 			CreateFieldRef(projection->add_expressions(), right_idx + left_col_count);
 		}
@@ -1223,17 +1324,31 @@ substrait::Rel *DuckDBToSubstrait::TransformAggregateGroup(LogicalOperator &dop)
 	auto &daggr = dop.Cast<LogicalAggregate>();
 	auto saggr = res->mutable_aggregate();
 	saggr->set_allocated_input(TransformOp(*dop.children[0]));
-	if (!daggr.grouping_functions.empty()) {
-		throw NotImplementedException("Grouping functions not supported yet");
-	}
-	// we only do a single grouping set for now
-	auto sgrp = saggr->add_groupings();
+	
+	// In v0.89.0, grouping expressions are stored at the AggregateRel level
+	// and groupings reference them by index
 	for (auto &dgrp : daggr.groups) {
-		if (dgrp->type != ExpressionType::BOUND_REF) {
-			// TODO push projection or push substrait to allow expressions here
-			throw NotImplementedException("No expressions in groupings yet");
+		// Add the expression to the AggregateRel's grouping_expressions array
+		// This supports both simple column references (BOUND_REF) and complex expressions
+		auto grouping_expr = saggr->add_grouping_expressions();
+		TransformExpr(*dgrp, *grouping_expr);
+	}
+	
+	// Handle multiple grouping sets (for ROLLUP, CUBE, GROUPING SETS)
+	if (daggr.grouping_sets.empty()) {
+		// No explicit grouping sets - create a single grouping set with all groups
+		auto sgrp = saggr->add_groupings();
+		for (idx_t i = 0; i < daggr.groups.size(); i++) {
+			sgrp->add_expression_references(i);
 		}
-		TransformExpr(*dgrp, *sgrp->add_grouping_expressions());
+	} else {
+		// Multiple grouping sets - convert each one
+		for (auto &grouping_set : daggr.grouping_sets) {
+			auto sgrp = saggr->add_groupings();
+			for (auto &group_idx : grouping_set) {
+				sgrp->add_expression_references(group_idx);
+			}
+		}
 	}
 	for (auto &dmeas : daggr.expressions) {
 		auto smeas = saggr->add_measures()->mutable_measure();
@@ -1255,7 +1370,325 @@ substrait::Rel *DuckDBToSubstrait::TransformAggregateGroup(LogicalOperator &dop)
 			smeas->set_invocation(substrait::AggregateFunction_AggregationInvocation_AGGREGATION_INVOCATION_DISTINCT);
 		}
 	}
+	
+	// Transform GROUPING() function calls
+	// Each grouping function is represented as an aggregate function measure
+	// that takes field references to the grouping columns it references
+	for (auto &grouping_func : daggr.grouping_functions) {
+		auto smeas = saggr->add_measures()->mutable_measure();
+		
+		// Build argument types - each argument is a reference to a grouping column
+		vector<::substrait::Type> args_types;
+		for (auto &group_idx : grouping_func) {
+			// Each argument is a field reference to a grouping expression
+			if (group_idx >= daggr.groups.size()) {
+				throw InternalException("Grouping index out of bounds");
+			}
+			auto s_arg = smeas->add_arguments();
+			auto field_ref = s_arg->mutable_value();
+			CreateFieldRef(field_ref, group_idx);
+			
+			// Get the type of the grouping column
+			args_types.emplace_back(DuckToSubstraitType(daggr.groups[group_idx]->return_type));
+		}
+		
+		// Register the "grouping" function as an aggregate function
+		smeas->set_function_reference(RegisterFunction("grouping", args_types));
+		
+		// GROUPING() returns BIGINT in DuckDB
+		*smeas->mutable_output_type() = DuckToSubstraitType(LogicalType::BIGINT);
+	}
+	
 	return res;
+}
+
+substrait::Rel *DuckDBToSubstrait::TransformWindow(LogicalOperator &dop) {
+	auto &dwindow = dop.Cast<LogicalWindow>();
+	
+	// Group window expressions by their partition and order specifications
+	// Key: hash of partition expressions + order expressions
+	// Value: vector of indices into dwindow.expressions
+	struct WindowSpec {
+		vector<unique_ptr<Expression>> partitions;
+		vector<BoundOrderByNode> orders;
+		vector<idx_t> expression_indices;
+		
+		// Helper to create a signature for comparison
+		string GetSignature() const {
+			string sig = "P:";
+			for (auto &part : partitions) {
+				sig += part->ToString() + ";";
+			}
+			sig += "O:";
+			for (auto &order : orders) {
+				sig += order.expression->ToString() + ":" +
+				       (order.type == OrderType::ASCENDING ? "ASC" : "DESC") + ";";
+			}
+			return sig;
+		}
+	};
+	
+	vector<WindowSpec> window_specs;
+	
+	// Group expressions by their window specifications
+	for (idx_t i = 0; i < dwindow.expressions.size(); i++) {
+		auto &dexpr = dwindow.expressions[i];
+		if (dexpr->GetExpressionClass() != ExpressionClass::BOUND_WINDOW) {
+			throw NotImplementedException("Only window expressions are supported in window operator");
+		}
+		
+		auto &dwin_expr = dexpr->Cast<BoundWindowExpression>();
+		
+		// Create a spec for this expression
+		WindowSpec current_spec;
+		for (auto &part : dwin_expr.partitions) {
+			current_spec.partitions.push_back(part->Copy());
+		}
+		for (auto &order : dwin_expr.orders) {
+			current_spec.orders.push_back(order.Copy());
+		}
+		
+		// Find if we already have this spec
+		bool found = false;
+		for (auto &spec : window_specs) {
+			if (spec.GetSignature() == current_spec.GetSignature()) {
+				spec.expression_indices.push_back(i);
+				found = true;
+				break;
+			}
+		}
+		
+		if (!found) {
+			current_spec.expression_indices.push_back(i);
+			window_specs.push_back(std::move(current_spec));
+		}
+	}
+	
+	// Now create chained window relations, one for each unique spec
+	substrait::Rel *current_input = TransformOp(*dop.children[0]);
+	
+	for (auto &spec : window_specs) {
+		auto res = make_uniq<substrait::Rel>();
+		auto swindow = res->mutable_window();
+		
+		// Set the input (either the original input or the previous window relation)
+		swindow->set_allocated_input(current_input);
+		
+		// Set partition expressions at relation level
+		for (auto &dpart : spec.partitions) {
+			TransformExpr(*dpart, *swindow->add_partition_expressions());
+		}
+		
+		// Set sort specifications at relation level
+		for (auto &dorder : spec.orders) {
+			TransformOrder(dorder, *swindow->add_sorts());
+		}
+		
+		// Process each window function expression in this group
+		for (auto expr_idx : spec.expression_indices) {
+			auto &dexpr = dwindow.expressions[expr_idx];
+			auto &dwin_expr = dexpr->Cast<BoundWindowExpression>();
+		auto swin_func = swindow->add_window_functions();
+		
+		// Set output type
+		*swin_func->mutable_output_type() = DuckToSubstraitType(dwin_expr.return_type);
+		
+		// Determine function name and add arguments
+		string function_name;
+		vector<::substrait::Type> args_types;
+		
+		if (dwin_expr.type == ExpressionType::WINDOW_AGGREGATE) {
+			// This is an aggregate function used as a window function
+			if (!dwin_expr.aggregate) {
+				throw InternalException("Window aggregate expression missing aggregate function");
+			}
+			function_name = dwin_expr.aggregate->name;
+			
+			// Handle DISTINCT aggregates
+			if (dwin_expr.distinct) {
+				swin_func->set_invocation(substrait::AggregateFunction_AggregationInvocation_AGGREGATION_INVOCATION_DISTINCT);
+			}
+		} else {
+			// This is a window-specific function (ROW_NUMBER, RANK, DENSE_RANK, etc.)
+			switch (dwin_expr.type) {
+			case ExpressionType::WINDOW_ROW_NUMBER:
+				function_name = "row_number";
+				break;
+			case ExpressionType::WINDOW_RANK:
+				function_name = "rank";
+				break;
+			case ExpressionType::WINDOW_RANK_DENSE:
+				function_name = "dense_rank";
+				break;
+			case ExpressionType::WINDOW_PERCENT_RANK:
+				function_name = "percent_rank";
+				break;
+			case ExpressionType::WINDOW_CUME_DIST:
+				function_name = "cume_dist";
+				break;
+			case ExpressionType::WINDOW_NTILE:
+				function_name = "ntile";
+				break;
+			case ExpressionType::WINDOW_LAG:
+				function_name = "lag";
+				break;
+			case ExpressionType::WINDOW_LEAD:
+				function_name = "lead";
+				break;
+			case ExpressionType::WINDOW_FIRST_VALUE:
+				function_name = "first_value";
+				break;
+			case ExpressionType::WINDOW_LAST_VALUE:
+				function_name = "last_value";
+				break;
+			case ExpressionType::WINDOW_NTH_VALUE:
+				function_name = "nth_value";
+				break;
+			default:
+				throw NotImplementedException("Unsupported window function type: " + ExpressionTypeToString(dwin_expr.type));
+			}
+		}
+		
+		// Add function arguments
+		for (auto &darg : dwin_expr.children) {
+			auto s_arg = swin_func->add_arguments();
+			args_types.emplace_back(DuckToSubstraitType(darg->return_type));
+			TransformExpr(*darg, *s_arg->mutable_value());
+		}
+		
+		// Add offset and default for LAG/LEAD
+		if (dwin_expr.offset_expr) {
+			auto s_arg = swin_func->add_arguments();
+			args_types.emplace_back(DuckToSubstraitType(dwin_expr.offset_expr->return_type));
+			TransformExpr(*dwin_expr.offset_expr, *s_arg->mutable_value());
+		}
+		if (dwin_expr.default_expr) {
+			auto s_arg = swin_func->add_arguments();
+			args_types.emplace_back(DuckToSubstraitType(dwin_expr.default_expr->return_type));
+			TransformExpr(*dwin_expr.default_expr, *s_arg->mutable_value());
+		}
+		
+		swin_func->set_function_reference(RegisterFunction(RemapFunctionName(function_name), args_types));
+		
+		// Set window frame bounds
+		// Determine frame type (ROWS, RANGE, or GROUPS)
+		substrait::Expression_WindowFunction_BoundsType bounds_type;
+		
+		switch (dwin_expr.start) {
+		case WindowBoundary::CURRENT_ROW_ROWS:
+		case WindowBoundary::EXPR_PRECEDING_ROWS:
+		case WindowBoundary::EXPR_FOLLOWING_ROWS:
+			bounds_type = substrait::Expression_WindowFunction_BoundsType_BOUNDS_TYPE_ROWS;
+			break;
+		case WindowBoundary::CURRENT_ROW_GROUPS:
+		case WindowBoundary::EXPR_PRECEDING_GROUPS:
+		case WindowBoundary::EXPR_FOLLOWING_GROUPS:
+			// GROUPS is not supported in this version of Substrait, treat as ROWS
+			bounds_type = substrait::Expression_WindowFunction_BoundsType_BOUNDS_TYPE_ROWS;
+			break;
+		case WindowBoundary::CURRENT_ROW_RANGE:
+		case WindowBoundary::EXPR_PRECEDING_RANGE:
+		case WindowBoundary::EXPR_FOLLOWING_RANGE:
+			bounds_type = substrait::Expression_WindowFunction_BoundsType_BOUNDS_TYPE_RANGE;
+			break;
+		default:
+			// Check end boundary
+			switch (dwin_expr.end) {
+			case WindowBoundary::CURRENT_ROW_ROWS:
+			case WindowBoundary::EXPR_PRECEDING_ROWS:
+			case WindowBoundary::EXPR_FOLLOWING_ROWS:
+				bounds_type = substrait::Expression_WindowFunction_BoundsType_BOUNDS_TYPE_ROWS;
+				break;
+			case WindowBoundary::CURRENT_ROW_GROUPS:
+			case WindowBoundary::EXPR_PRECEDING_GROUPS:
+			case WindowBoundary::EXPR_FOLLOWING_GROUPS:
+				// GROUPS is not supported in this version of Substrait, treat as ROWS
+				bounds_type = substrait::Expression_WindowFunction_BoundsType_BOUNDS_TYPE_ROWS;
+				break;
+			default:
+				// Default to RANGE
+				bounds_type = substrait::Expression_WindowFunction_BoundsType_BOUNDS_TYPE_RANGE;
+				break;
+			}
+			break;
+		}
+		
+		swin_func->set_bounds_type(bounds_type);
+		
+		// Helper function to transform window boundaries
+		auto TransformWindowBoundary = [](WindowBoundary boundary_type,
+		                                   const unique_ptr<Expression>& boundary_expr,
+		                                   substrait::Expression_WindowFunction_Bound* bound,
+		                                   bool is_start_bound) {
+			switch (boundary_type) {
+			case WindowBoundary::UNBOUNDED_PRECEDING:
+			case WindowBoundary::UNBOUNDED_FOLLOWING:
+				bound->mutable_unbounded();
+				break;
+			case WindowBoundary::CURRENT_ROW_ROWS:
+			case WindowBoundary::CURRENT_ROW_RANGE:
+			case WindowBoundary::CURRENT_ROW_GROUPS:
+				bound->mutable_current_row();
+				break;
+			case WindowBoundary::EXPR_PRECEDING_ROWS:
+			case WindowBoundary::EXPR_PRECEDING_RANGE:
+			case WindowBoundary::EXPR_PRECEDING_GROUPS:
+				if (boundary_expr) {
+					// For now, we only support constant integer offsets
+					// TODO: Support expression-based offsets
+					if (boundary_expr->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+						auto &const_expr = boundary_expr->Cast<BoundConstantExpression>();
+						auto preceding = bound->mutable_preceding();
+						preceding->set_offset(const_expr.value.GetValue<int64_t>());
+					} else {
+						throw NotImplementedException("Only constant offsets are supported for window bounds");
+					}
+				} else {
+					throw InternalException("Window boundary expression missing for PRECEDING");
+				}
+				break;
+			case WindowBoundary::EXPR_FOLLOWING_ROWS:
+			case WindowBoundary::EXPR_FOLLOWING_RANGE:
+			case WindowBoundary::EXPR_FOLLOWING_GROUPS:
+				if (boundary_expr) {
+					// For now, we only support constant integer offsets
+					if (boundary_expr->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+						auto &const_expr = boundary_expr->Cast<BoundConstantExpression>();
+						auto following = bound->mutable_following();
+						following->set_offset(const_expr.value.GetValue<int64_t>());
+					} else {
+						throw NotImplementedException("Only constant offsets are supported for window bounds");
+					}
+				} else {
+					throw InternalException("Window boundary expression missing for FOLLOWING");
+				}
+				break;
+			default:
+				// Default to UNBOUNDED PRECEDING for start, CURRENT ROW for end
+				if (is_start_bound) {
+					bound->mutable_unbounded();
+				} else {
+					bound->mutable_current_row();
+				}
+				break;
+			}
+		};
+		
+		// Transform start bound
+		auto lower_bound = swin_func->mutable_lower_bound();
+		TransformWindowBoundary(dwin_expr.start, dwin_expr.start_expr, lower_bound, true);
+		
+		// Transform end bound
+		auto upper_bound = swin_func->mutable_upper_bound();
+		TransformWindowBoundary(dwin_expr.end, dwin_expr.end_expr, upper_bound, false);
+		}
+		
+		// Update current_input to chain the next window relation
+		current_input = res.release();
+	}
+	
+	// Return the last window relation in the chain
+	return current_input;
 }
 
 int32_t GetTimestampPrecision(LogicalTypeId type) {
@@ -1338,9 +1771,10 @@ substrait::Type DuckDBToSubstrait::DuckToSubstraitType(const LogicalType &type, 
 	}
 	case LogicalTypeId::TIME_TZ:
 	case LogicalTypeId::TIME: {
-		auto time_type = new substrait::Type_Time;
+		auto time_type = new substrait::Type_PrecisionTimestamp;
+		time_type->set_precision(6); // microseconds
 		time_type->set_nullability(type_nullability);
-		s_type.set_allocated_time(time_type);
+		s_type.set_allocated_precision_timestamp(time_type);
 		return s_type;
 	}
 	case LogicalTypeId::TIMESTAMP:
@@ -1532,8 +1966,39 @@ substrait::Rel *DuckDBToSubstrait::TransformDummyScan() {
 	auto virtual_table = sget->mutable_virtual_table();
 
 	// Add a dummy value to emit one row
-	auto dummy_value = virtual_table->add_values();
-	dummy_value->add_fields()->set_i32(42);
+	auto dummy_struct = virtual_table->add_values();
+	dummy_struct->add_fields()->set_i32(42);
+	return get_rel;
+}
+
+substrait::Rel *DuckDBToSubstrait::TransformEmptyResult(LogicalOperator &dop) {
+	// Create an empty virtual table to represent an empty result
+	// An empty virtual table (no rows) naturally represents an empty result
+	auto get_rel = new substrait::Rel();
+	auto sget = get_rel->mutable_read();
+	sget->mutable_virtual_table();
+	// Don't add any expressions - this creates an empty virtual table with no rows
+	
+	// Add base_schema to preserve the schema information
+	auto &empty_result = dop.Cast<LogicalEmptyResult>();
+	auto base_schema = new substrait::NamedStruct();
+	auto type_info = new substrait::Type_Struct();
+	type_info->set_nullability(substrait::Type_Nullability_NULLABILITY_REQUIRED);
+	
+	for (idx_t i = 0; i < empty_result.return_types.size(); i++) {
+		auto cur_type = empty_result.return_types[i];
+		// Use generic column names since LogicalEmptyResult doesn't have column names
+		base_schema->add_names("col" + std::to_string(i));
+		auto depth_names = DepthFirstNames(cur_type);
+		for (auto &name : depth_names) {
+			base_schema->add_names(name);
+		}
+		auto new_type = type_info->add_types();
+		*new_type = DuckToSubstraitType(cur_type, nullptr, false);
+	}
+	base_schema->set_allocated_struct_(type_info);
+	sget->set_allocated_base_schema(base_schema);
+	
 	return get_rel;
 }
 
@@ -1659,33 +2124,61 @@ substrait::Rel *DuckDBToSubstrait::TransformUnion(LogicalOperator &dop) {
 	return rel;
 }
 
-substrait::Rel *DuckDBToSubstrait::TransformDistinct(LogicalOperator &dop) {
-	auto rel = new substrait::Rel();
-
+substrait::Rel *DuckDBToSubstrait::CreateSetOperation(LogicalOperator &child_op,
+                                                       substrait::SetRel_SetOp set_op_type) {
+	auto rel = make_uniq<substrait::Rel>();
 	auto set_op = rel->mutable_set();
-
-	D_ASSERT(dop.children.size() == 1);
-	auto &set_operation_p = dop.children[0];
-
-	switch (set_operation_p->type) {
-	case LogicalOperatorType::LOGICAL_EXCEPT:
-		set_op->set_op(substrait::SetRel_SetOp::SetRel_SetOp_SET_OP_MINUS_PRIMARY);
-		break;
-	case LogicalOperatorType::LOGICAL_INTERSECT:
-		set_op->set_op(substrait::SetRel_SetOp::SetRel_SetOp_SET_OP_INTERSECTION_PRIMARY);
-		break;
-	default:
-		throw NotImplementedException("Found unexpected child type in Distinct operator " +
-		                              LogicalOperatorToString(set_operation_p->type));
-	}
-	auto &set_operation = set_operation_p->Cast<LogicalSetOperation>();
-
+	set_op->set_op(set_op_type);
+	auto &set_operation = child_op.Cast<LogicalSetOperation>();
 	auto inputs = set_op->mutable_inputs();
-
 	inputs->AddAllocated(TransformOp(*set_operation.children[0]));
 	inputs->AddAllocated(TransformOp(*set_operation.children[1]));
-	auto bindings = dop.GetColumnBindings();
-	return rel;
+	return rel.release();
+}
+
+substrait::Rel *DuckDBToSubstrait::TransformDistinct(LogicalOperator &dop) {
+	D_ASSERT(dop.children.size() == 1);
+	auto &child_op = dop.children[0];
+
+	// Check if this is a DISTINCT used with set operations (EXCEPT/INTERSECT)
+	// or a standalone DISTINCT operation
+	switch (child_op->type) {
+	case LogicalOperatorType::LOGICAL_EXCEPT:
+		// DISTINCT with EXCEPT - use SetRel
+		return CreateSetOperation(*child_op, substrait::SetRel_SetOp::SetRel_SetOp_SET_OP_MINUS_PRIMARY);
+	case LogicalOperatorType::LOGICAL_INTERSECT:
+		// DISTINCT with INTERSECT - use SetRel
+		return CreateSetOperation(*child_op, substrait::SetRel_SetOp::SetRel_SetOp_SET_OP_INTERSECTION_PRIMARY);
+	default: {
+		// Standalone DISTINCT operation - use AggregateRel with grouping but no measures
+		// This handles cases like: SELECT DISTINCT col1, col2 FROM table
+		auto rel = make_uniq<substrait::Rel>();
+		auto saggr = rel->mutable_aggregate();
+		
+		// Set the input relation
+		saggr->set_allocated_input(TransformOp(*child_op));
+		
+		// Get the column bindings from the DISTINCT operator
+		auto bindings = dop.GetColumnBindings();
+		
+		// Add all columns as grouping expressions
+		// In a standalone DISTINCT, all output columns become grouping keys
+		for (idx_t i = 0; i < bindings.size(); i++) {
+			auto grouping_expr = saggr->add_grouping_expressions();
+			auto field_ref = grouping_expr->mutable_selection()->mutable_direct_reference()->mutable_struct_field();
+			field_ref->set_field(i);
+		}
+		
+		// Create a single grouping set with all columns
+		auto sgrp = saggr->add_groupings();
+		for (idx_t i = 0; i < bindings.size(); i++) {
+			sgrp->add_expression_references(i);
+		}
+		
+		// No measures needed for DISTINCT - it's just grouping
+		return rel.release();
+	}
+	}
 }
 
 substrait::Rel *DuckDBToSubstrait::TransformExcept(LogicalOperator &dop) {
@@ -1847,6 +2340,8 @@ substrait::Rel *DuckDBToSubstrait::TransformOp(LogicalOperator &dop) {
 		return TransformComparisonJoin(dop);
 	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
 		return TransformAggregateGroup(dop);
+	case LogicalOperatorType::LOGICAL_WINDOW:
+		return TransformWindow(dop);
 	case LogicalOperatorType::LOGICAL_GET:
 		return TransformGet(dop);
 	case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
@@ -1863,6 +2358,8 @@ substrait::Rel *DuckDBToSubstrait::TransformOp(LogicalOperator &dop) {
 		return TransformIntersect(dop);
 	case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
 		return TransformDummyScan();
+	case LogicalOperatorType::LOGICAL_EMPTY_RESULT:
+		return TransformEmptyResult(dop);
 	case LogicalOperatorType::LOGICAL_CREATE_TABLE:
 		return TransformCreateTable(dop);
 	case LogicalOperatorType::LOGICAL_INSERT:
