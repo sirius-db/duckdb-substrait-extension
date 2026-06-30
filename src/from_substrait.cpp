@@ -841,7 +841,11 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformReadOp(const substrait::Rel &so
 			}
 		}
 		string name = "parquet_" + StringUtil::GenerateRandomName();
-		named_parameter_map_t named_parameters({{"binary_as_string", Value::BOOLEAN(false)}});
+		// baseSchema is authoritative for the read's columns, so disable hive
+		// partition auto-detection: a "key=value" path segment must not silently
+		// add a partition column that shifts the column layout.
+		named_parameter_map_t named_parameters(
+		    {{"binary_as_string", Value::BOOLEAN(false)}, {"hive_partitioning", Value::BOOLEAN(false)}});
 		vector<Value> parameters {Value::LIST(parquet_files)};
 		shared_ptr<TableFunctionRelation> scan_rel;
 		if (acquire_lock) {
@@ -950,15 +954,24 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformReadOp(const substrait::Rel &so
 		throw NotImplementedException("Unsupported type of read operator for substrait");
 	}
 
-	// When a named table's physical schema has more columns than the plan's
-	// baseSchema declares, add a projection to narrow down to only the declared
-	// columns. Without this, downstream emit mappings (which assume baseSchema
-	// column count) compute wrong expression indices.
-	if (sget.has_named_table() && sget.has_base_schema() && !sget.has_projection()) {
+	// Align the scan's physical columns to the plan's baseSchema by name.
+	//
+	// Named table: when the physical schema is wider than baseSchema declares,
+	// narrow to the declared columns. Without this, downstream emit mappings (which
+	// assume the baseSchema column count) compute wrong expression indices.
+	//
+	// Local files: parquet_scan binds to the file's physical columns in file order,
+	// but baseSchema is authoritative for the scan tuple. Project by name so a
+	// pruned or reordered read lines up with the declared columns instead of being
+	// consumed positionally against the raw file layout.
+	if ((sget.has_named_table() || sget.has_local_files()) && sget.has_base_schema() &&
+	    !sget.has_projection()) {
 		auto &base_schema = sget.base_schema();
 		auto physical_cols = scan->Columns().size();
 		auto declared_cols = (size_t)base_schema.names_size();
-		if (declared_cols > 0 && declared_cols < physical_cols) {
+		bool needs_projection = sget.has_local_files() ? (declared_cols > 0)
+		                                               : (declared_cols > 0 && declared_cols < physical_cols);
+		if (needs_projection) {
 			// Match baseSchema column names to physical column positions
 			vector<unique_ptr<ParsedExpression>> proj_exprs;
 			vector<string> proj_aliases;
