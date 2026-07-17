@@ -297,6 +297,21 @@ unique_ptr<ParsedExpression> SubstraitToDuckDB::TransformScalarFunctionExpr(cons
 		// Convert to DuckDB's OPERATOR_COALESCE
 		D_ASSERT(children.size() >= 1);
 		return make_uniq<OperatorExpression>(ExpressionType::OPERATOR_COALESCE, std::move(children));
+	} else if (function_name == "like" || function_name == "ilike") {
+		if (children.size() != 2 && children.size() != 3) {
+			throw InvalidInputException("Substrait %s expects two or three arguments, got %d", function_name,
+			                            children.size());
+		}
+		if (children.size() == 3) {
+			auto &escape = children.back();
+			if (escape->GetExpressionClass() == ExpressionClass::CONSTANT &&
+			    escape->Cast<ConstantExpression>().value.IsNull()) {
+				children.pop_back();
+			} else {
+				return make_uniq<FunctionExpression>(function_name + "_escape", std::move(children));
+			}
+		}
+		return make_uniq<FunctionExpression>(function_name == "like" ? "~~" : "~~*", std::move(children));
 	} else if (function_name == "extract") {
 		D_ASSERT(enum_expressions.size() == 1);
 		auto &subfield = enum_expressions[0];

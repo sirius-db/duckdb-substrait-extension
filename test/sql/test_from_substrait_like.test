@@ -1,0 +1,96 @@
+# name: test/sql/test_from_substrait_like.test
+# description: Test Substrait LIKE escape arguments
+# group: [sql]
+
+require substrait
+
+statement ok
+CREATE TABLE strings (value VARCHAR);
+
+statement ok
+INSERT INTO strings VALUES ('BRASS'), ('POLISHED BRASS'), ('TIN'), ('PROMO%TYPE'), ('PROMOATYPE');
+
+# DataFusion represents an omitted LIKE escape as a third, typed-null argument.
+query T rowsort
+CALL from_substrait_json('{
+  "relations": [{
+    "root": {
+      "input": {
+        "filter": {
+          "input": {
+            "read": {
+              "baseSchema": {
+                "names": ["value"],
+                "struct": {
+                  "types": [{"string": {"nullability": "NULLABILITY_REQUIRED"}}],
+                  "nullability": "NULLABILITY_REQUIRED"
+                }
+              },
+              "namedTable": {"names": ["strings"]}
+            }
+          },
+          "condition": {
+            "scalarFunction": {
+              "functionReference": 1,
+              "arguments": [
+                {"value": {"selection": {"directReference": {"structField": {}}, "rootReference": {}}}},
+                {"value": {"literal": {"string": "%BRASS"}}},
+                {"value": {"literal": {"null": {"string": {"nullability": "NULLABILITY_NULLABLE"}}}}}
+              ],
+              "outputType": {"bool": {"nullability": "NULLABILITY_REQUIRED"}}
+            }
+          }
+        }
+      },
+      "names": ["value"]
+    }
+  }],
+  "extensions": [{
+    "extensionFunction": {"functionAnchor": 1, "name": "like"}
+  }]
+}')
+----
+BRASS
+POLISHED BRASS
+
+# A real third argument uses DuckDB's LIKE ESCAPE function.
+query T
+CALL from_substrait_json('{
+  "relations": [{
+    "root": {
+      "input": {
+        "filter": {
+          "input": {
+            "read": {
+              "baseSchema": {
+                "names": ["value"],
+                "struct": {
+                  "types": [{"string": {"nullability": "NULLABILITY_REQUIRED"}}],
+                  "nullability": "NULLABILITY_REQUIRED"
+                }
+              },
+              "namedTable": {"names": ["strings"]}
+            }
+          },
+          "condition": {
+            "scalarFunction": {
+              "functionReference": 1,
+              "arguments": [
+                {"value": {"selection": {"directReference": {"structField": {}}, "rootReference": {}}}},
+                {"value": {"literal": {"string": "PROMO$%%"}}},
+                {"value": {"literal": {"string": "$"}}}
+              ],
+              "outputType": {"bool": {"nullability": "NULLABILITY_REQUIRED"}}
+            }
+          }
+        }
+      },
+      "names": ["value"]
+    }
+  }],
+  "extensions": [{
+    "extensionFunction": {"functionAnchor": 1, "name": "like"}
+  }]
+}')
+----
+PROMO%TYPE
