@@ -64,11 +64,13 @@ private:
 	substrait::Rel *TransformOrderBy(LogicalOperator &dop);
 	substrait::Rel *TransformComparisonJoin(LogicalOperator &dop);
 	substrait::Rel *TransformAggregateGroup(LogicalOperator &dop);
+	substrait::Rel *TransformWindow(LogicalOperator &dop);
 	substrait::Rel *TransformExpressionGet(LogicalOperator &dop);
 	substrait::Rel *TransformGet(LogicalOperator &dop);
 	substrait::Rel *TransformCrossProduct(LogicalOperator &dop);
 	substrait::Rel *TransformUnion(LogicalOperator &dop);
 	substrait::Rel *TransformDistinct(LogicalOperator &dop);
+	substrait::Rel *CreateSetOperation(LogicalOperator &child_op, substrait::SetRel_SetOp set_op_type);
 	substrait::Rel *TransformExcept(LogicalOperator &dop);
 	substrait::Rel *TransformIntersect(LogicalOperator &dop);
 	substrait::Rel *TransformCreateTable(LogicalOperator &dop);
@@ -77,6 +79,7 @@ private:
 	substrait::Rel *TransformCTERef(LogicalOperator &dop);
 	static vector<LogicalType>::size_type GetColumnCount(LogicalOperator &dop);
 	static substrait::Rel *TransformDummyScan();
+	substrait::Rel *TransformEmptyResult(LogicalOperator &dop);
 	static substrait::RelCommon *CreateOutputMapping(vector<int32_t> vector);
 	static bool IsPassthroughProjection(LogicalProjection &dproj, idx_t child_column_count, bool &needs_output_mapping);
 	//! Methods to transform different LogicalGet Types (e.g., Table, Parquet)
@@ -114,6 +117,7 @@ private:
 	void TransformNotNullExpression(Expression &dexpr, substrait::Expression &sexpr, uint64_t col_offset);
 	void TransformIsNullExpression(Expression &dexpr, substrait::Expression &sexpr, uint64_t col_offset);
 	void TransformNotExpression(Expression &dexpr, substrait::Expression &sexpr, uint64_t col_offset);
+	void TransformCoalesceExpression(Expression &dexpr, substrait::Expression &sexpr, uint64_t col_offset);
 	void TransformCaseExpression(Expression &dexpr, substrait::Expression &sexpr);
 	void TransformInExpression(Expression &dexpr, substrait::Expression &sexpr);
 	//! Transforms a DuckDB Logical Type into a Substrait Type
@@ -182,7 +186,7 @@ private:
 
 	//! Variables used to register functions
 	unordered_map<string, uint64_t> functions_map;
-	unordered_map<string, uint64_t> extension_uri_map;
+	unordered_map<string, uint64_t> extension_urn_map;
 
 	//! Remapped DuckDB functions names to Substrait compatible function names
 	static const unordered_map<std::string, std::string> function_names_remap;
@@ -190,7 +194,7 @@ private:
 	//! Variable that holds information about yaml function extensions
 	static const SubstraitCustomFunctions custom_functions;
 	uint64_t last_function_id = 1;
-	uint64_t last_uri_id = 1;
+	uint64_t last_urn_id = 1;
 	//! The substrait Plan
 	substrait::Plan plan;
 	ClientContext &context;
