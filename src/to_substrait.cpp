@@ -1905,6 +1905,18 @@ set<idx_t> GetNotNullConstraintCol(const TableCatalogEntry &tbl) {
 	return not_null;
 }
 
+unique_ptr<BaseStatistics> GetSubstraitColumnStatistics(ClientContext &context, LogicalGet &get,
+                                                        const FunctionData &bind_data, idx_t column_index) {
+	if (get.function.statistics_extended) {
+		TableFunctionGetStatisticsInput input(&bind_data, ColumnIndex(column_index));
+		return get.function.statistics_extended(context, input);
+	}
+	if (get.function.statistics) {
+		return get.function.statistics(context, &bind_data, column_index);
+	}
+	return nullptr;
+}
+
 void DuckDBToSubstrait::TransformTableScanToSubstrait(LogicalGet &dget, substrait::ReadRel *sget) const {
 	auto &table_scan_bind_data = dget.bind_data->Cast<TableScanBindData>();
 	auto &table = table_scan_bind_data.table;
@@ -1920,7 +1932,7 @@ void DuckDBToSubstrait::TransformTableScanToSubstrait(LogicalGet &dget, substrai
 		for (auto &name : depth_names) {
 			base_schema->add_names(name);
 		}
-		auto column_statistics = dget.function.statistics(context, &table_scan_bind_data, i);
+		auto column_statistics = GetSubstraitColumnStatistics(context, dget, table_scan_bind_data, i);
 		bool not_null = not_null_constraint.find(i) != not_null_constraint.end();
 		auto new_type = type_info->add_types();
 		*new_type = DuckToSubstraitType(cur_type, column_statistics.get(), not_null);
@@ -1951,7 +1963,7 @@ void DuckDBToSubstrait::TransformParquetScanToSubstrait(LogicalGet &dget, substr
 		for (auto &name : depth_names) {
 			base_schema->add_names(name);
 		}
-		auto column_statistics = dget.function.statistics(context, &bind_data, i);
+		auto column_statistics = GetSubstraitColumnStatistics(context, dget, bind_data, i);
 		auto new_type = type_info->add_types();
 		*new_type = DuckToSubstraitType(cur_type, column_statistics.get(), false);
 	}
