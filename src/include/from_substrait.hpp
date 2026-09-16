@@ -11,6 +11,7 @@
 #include <string>
 #include <unordered_map>
 #include "substrait/plan.pb.h"
+#include "duckdb/common/identifier.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 
@@ -123,7 +124,7 @@ private:
 	//! field references into a name-based ColumnRefExpression against the "left" alias.
 	struct LateralScope {
 		uint32_t rel_anchor;
-		vector<string> left_column_names;
+		vector<Identifier> left_column_names;
 	};
 	vector<LateralScope> lateral_scopes;
 	//! Remapped functions with differing names to the correct DuckDB functions
