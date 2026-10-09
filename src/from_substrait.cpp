@@ -4,6 +4,7 @@
 #include <cinttypes>
 #include <cmath>
 
+#include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/parser/expression/list.hpp"
 #include "duckdb/main/connection.hpp"
@@ -582,11 +583,82 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformCrossProductOp(const substrait:
 	                                             TransformOp(sub_cross.right())->Alias("right"));
 }
 
+// A FetchRel bound given as an expression (`count_expr`, `offset_expr`): a non-negative integer
+// literal, or a null literal, which the spec reads as "all records" for a count and 0 for an offset.
+static optional_idx TransformFetchBound(const substrait::Expression &sexpr, const char *field) {
+	if (!sexpr.has_literal()) {
+		throw NotImplementedException("FetchRel %s must be a literal", field);
+	}
+	auto &literal = sexpr.literal();
+	int64_t value;
+	switch (literal.literal_type_case()) {
+	case substrait::Expression_Literal::LiteralTypeCase::kNull:
+		return optional_idx();
+	case substrait::Expression_Literal::LiteralTypeCase::kI8:
+		value = literal.i8();
+		break;
+	case substrait::Expression_Literal::LiteralTypeCase::kI16:
+		value = literal.i16();
+		break;
+	case substrait::Expression_Literal::LiteralTypeCase::kI32:
+		value = literal.i32();
+		break;
+	case substrait::Expression_Literal::LiteralTypeCase::kI64:
+		value = literal.i64();
+		break;
+	default:
+		throw NotImplementedException("FetchRel %s must be an integer literal", field);
+	}
+	if (value < 0) {
+		throw InvalidInputException("FetchRel %s must not be negative, got %lld", field, (long long)value);
+	}
+	return optional_idx(static_cast<idx_t>(value));
+}
+
 shared_ptr<Relation> SubstraitToDuckDB::TransformFetchOp(const substrait::Rel &sop,
                                                          const google::protobuf::RepeatedPtrField<std::string> *names) {
 	auto &slimit = sop.fetch();
-	idx_t limit = slimit.count() == -1 ? NumericLimits<idx_t>::Maximum() : slimit.count();
-	idx_t offset = slimit.offset();
+	// An unset count means all records, and an unset offset means 0. The deprecated `count` and
+	// `offset` share a oneof with `count_expr` and `offset_expr`, so only one of each is ever set.
+	idx_t limit = NumericLimits<idx_t>::Maximum();
+	switch (slimit.count_mode_case()) {
+	case substrait::FetchRel::kCount:
+		if (slimit.count() < -1) {
+			throw InvalidInputException("FetchRel count must not be negative, got %lld", (long long)slimit.count());
+		}
+		// -1 means all records.
+		if (slimit.count() != -1) {
+			limit = static_cast<idx_t>(slimit.count());
+		}
+		break;
+	case substrait::FetchRel::kCountExpr: {
+		auto count = TransformFetchBound(slimit.count_expr(), "count_expr");
+		if (count.IsValid()) {
+			limit = count.GetIndex();
+		}
+		break;
+	}
+	default:
+		break;
+	}
+	idx_t offset = 0;
+	switch (slimit.offset_mode_case()) {
+	case substrait::FetchRel::kOffset:
+		if (slimit.offset() < 0) {
+			throw InvalidInputException("FetchRel offset must not be negative, got %lld", (long long)slimit.offset());
+		}
+		offset = static_cast<idx_t>(slimit.offset());
+		break;
+	case substrait::FetchRel::kOffsetExpr: {
+		auto skip = TransformFetchBound(slimit.offset_expr(), "offset_expr");
+		if (skip.IsValid()) {
+			offset = skip.GetIndex();
+		}
+		break;
+	}
+	default:
+		break;
+	}
 	return make_shared_ptr<LimitRelation>(TransformOp(slimit.input(), names), limit, offset);
 }
 
