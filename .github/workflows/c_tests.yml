@@ -8,6 +8,8 @@ defaults:
 
 jobs:
   unitTests:
+    # Sirius validates the v2 reader; the standalone extension is not ported yet.
+    if: github.ref != 'refs/heads/v2' && github.head_ref != 'v2'
     name: C unit tests
     runs-on: macos-latest
     env:

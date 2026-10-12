@@ -3,6 +3,20 @@
 The DuckDB Substrait Extension is a [DuckDB Community Extension](https://duckdb.org/community_extensions/) that provides [Substrait](https://substrait.io) support to [DuckDB](https://www.duckdb.org).
 With this extension, DuckDB can produce Substrait plans from DuckDB queries as well as consume Substrait plans and execute them with DuckDB.
 
+## Sirius v2 reader branch
+
+This branch ports the Substrait reader (`src/from_substrait.cpp`) to DuckDB v2
+for embedding in Sirius. Sirius supplies DuckDB and compiles the reader directly.
+The standalone Substrait extension and its nested DuckDB pin have not been ported;
+the extension build instructions below do not apply to this branch yet.
+
+This is the reader branch used by Sirius's v2 migration. The older `duckdb-main`
+and `duckdb-main-port` branches target earlier DuckDB APIs. Reader validation runs
+in Sirius; this branch skips the standalone extension's C tests.
+
+The reader retains the bundled, namespaced Protobuf sources. Updating to upstream's
+external Protobuf and newer Substrait schemas also requires updating Sirius's dependencies.
+
 ## Building
 
 To build the extension, first clone this repository and initialize git submodules by running:
