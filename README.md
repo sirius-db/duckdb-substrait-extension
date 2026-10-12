@@ -12,7 +12,7 @@ the extension build instructions below do not apply to this branch yet.
 
 This is the reader branch used by Sirius's v2 migration. The older `duckdb-main`
 and `duckdb-main-port` branches target earlier DuckDB APIs. Reader validation runs
-in Sirius; this branch skips the standalone extension's C tests.
+in Sirius; this branch skips standalone extension builds and tests.
 
 The reader retains the bundled, namespaced Protobuf sources. Updating to upstream's
 external Protobuf and newer Substrait schemas also requires updating Sirius's dependencies.

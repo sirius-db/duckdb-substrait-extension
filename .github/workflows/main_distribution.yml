@@ -18,6 +18,8 @@ concurrency:
 
 jobs:
   duckdb-main-build:
+    # Sirius validates the v2 reader; this branch does not build a standalone extension.
+    if: github.ref != 'refs/heads/v2' && github.head_ref != 'v2'
     name: Build extension binaries
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@16d89a59ee14904a62383e83c300432b19d29abc
     with:
