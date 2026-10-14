@@ -7,7 +7,7 @@ require substrait
 require tpch
 
 statement ok
-PRAGMA enable_verification
+SET substrait_verify_roundtrip = true
 
 statement ok
 call dbgen(sf=0.01)

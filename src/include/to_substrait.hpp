@@ -134,22 +134,7 @@ private:
 	//! Methods to transform DuckDB Filters to Substrait Expression
 	substrait::Expression *TransformFilter(uint64_t col_idx, const LogicalType &column_type, const TableFilter &dfilter,
 	                                       const LogicalType &return_type);
-	substrait::Expression *TransformIsNotNullFilter(uint64_t col_idx, const LogicalType &column_type,
-	                                                const TableFilter &dfilter, const LogicalType &return_type);
-	substrait::Expression *TransformIsNullFilter(uint64_t col_idx, const LogicalType &column_type,
-	                                             const TableFilter &dfilter, const LogicalType &return_type);
-	substrait::Expression *TransformConjunctionAndFilter(uint64_t col_idx, const LogicalType &column_type,
-	                                                     const TableFilter &dfilter, const LogicalType &return_type);
-	substrait::Expression *TransformConjunctionOrFilter(uint64_t col_idx, const LogicalType &column_type,
-	                                                    const TableFilter &dfilter, const LogicalType &return_type);
-		substrait::Expression *TransformConstantComparisonFilter(uint64_t col_idx, const LogicalType &column_type,
-	                                                         const TableFilter &dfilter, const LogicalType &return_type);
-		substrait::Expression *TransformStructExtractFilter(uint64_t col_idx, const LogicalType &column_type, const TableFilter &dfilter, const LogicalType &return_type);
-		substrait::Expression *TransformExpressionFilter(uint64_t col_idx, const LogicalType &column_type, const TableFilter &dfilter, const LogicalType &return_type);
-		substrait::Expression *TransformInFilter(uint64_t col_idx, const LogicalType &column_type, const TableFilter &dfilter, const LogicalType &return_type);
-	substrait::Expression *TransformDynamicFilter(uint64_t col_idx, const LogicalType &column_type, const TableFilter &dfilter, const LogicalType &return_type);
-
-
+	substrait::Expression *TransformFilterExpression(Expression &expression);
 	//! Transforms DuckDB Join Conditions to Substrait Expression
 	substrait::Expression *TransformJoinCond(const JoinCondition &dcond, uint64_t left_ncol);
 	//! Transforms DuckDB Sort Order to Substrait Sort Order

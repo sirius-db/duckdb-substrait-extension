@@ -5,7 +5,7 @@
 require substrait
 
 statement ok
-PRAGMA enable_verification
+SET substrait_verify_roundtrip = true
 
 statement ok
 CREATE table ints (i INT);
@@ -20,6 +20,9 @@ CALL get_substrait('SELECT abs(i) FROM ints');
 # unoptimized
 statement ok
 CALL get_substrait('SELECT abs(i) FROM ints', enable_optimizer=false);
+
+statement ok
+CALL get_substrait('SELECT i, count(*) FROM ints GROUP BY ROLLUP(i)', enable_optimizer=false);
 
 statement ok
 CREATE table tbl (v varchar);
@@ -54,9 +57,9 @@ CALL get_substrait('select * from tbl where v LIKE ''duck%''');
 
 # But the `enable_optimizer` option takes precedence over the connection-level settings.
 query I
-CALL get_substrait('select * from tbl where v LIKE ''duck%''', enable_optimizer=true);
+CALL get_substrait('select * from tbl where v LIKE ''%y''', enable_optimizer=true);
 ----
-<REGEX>:.*gte:any_any.*
+<REGEX>:.*ends_with:str_str.*
 
 # Finally, the user can disable specific optimizers when generating Substrait by changing the connection-level settings.
 statement ok
@@ -131,9 +134,9 @@ CALL get_substrait_json('select * from tbl_json where v LIKE ''duck%''');
 
 # But the `enable_optimizer` option takes precedence over the connection-level settings.
 query I
-CALL get_substrait_json('select * from tbl_json where v LIKE ''duck%''', enable_optimizer=true);
+CALL get_substrait_json('select * from tbl_json where v LIKE ''%y''', enable_optimizer=true);
 ----
-<REGEX>:.*gte:any_any.*
+<REGEX>:.*ends_with:str_str.*
 
 # Finally, the user can disable specific optimizers when generating Substrait by changing the connection-level settings.
 statement ok

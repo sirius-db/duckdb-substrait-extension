@@ -72,15 +72,15 @@ EmitJSON EmitPlan(const EmitJSON &rel, const EmitJSON &names) {
 void CheckEmitColumns(Connection &con, const EmitJSON &rel, const duckdb::vector<LogicalType> &types,
                       const duckdb::vector<duckdb::vector<Value>> &columns) {
 	EmitJSON names = EmitJSON::array();
-	duckdb::vector<string> expected_names;
+	duckdb::vector<Identifier> expected_names;
 	for (idx_t i = 0; i < types.size(); i++) {
-		expected_names.push_back("output_" + to_string(i));
-		names.push_back(expected_names.back());
+		expected_names.push_back(Identifier("output_" + to_string(i)));
+		names.push_back(expected_names.back().GetIdentifierName());
 	}
 	auto result = FromSubstraitJSON(con, EmitPlan(rel, names).dump());
 	REQUIRE_NO_FAIL(*result);
-	REQUIRE(result->names == expected_names);
-	REQUIRE(result->types == types);
+	REQUIRE(result->GetNames() == expected_names);
+	REQUIRE(result->GetTypes() == types);
 	for (idx_t i = 0; i < columns.size(); i++) {
 		REQUIRE(CHECK_COLUMN(result, i, columns[i]));
 	}
