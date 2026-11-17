@@ -1207,6 +1207,9 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformSetOp(const substrait::Rel &sop
 	auto &set = sop.set();
 	auto set_op_type = set.op();
 	auto type = TransformSetOperationType(set_op_type);
+	// UNION_ALL keeps duplicates; the other supported set ops are the DISTINCT variants.
+	// Without this, UNION_ALL would map to a plain UNION and incorrectly drop duplicates.
+	bool setop_all = set_op_type == substrait::SetRel_SetOp::SetRel_SetOp_SET_OP_UNION_ALL;
 
 	auto &inputs = set.inputs();
 	auto input_count = set.inputs_size();
@@ -1216,7 +1219,7 @@ shared_ptr<Relation> SubstraitToDuckDB::TransformSetOp(const substrait::Rel &sop
 	auto lhs = TransformOp(inputs[0]);
 	auto rhs = TransformOp(inputs[1], names);
 
-	return make_shared_ptr<SetOpRelation>(std::move(lhs), std::move(rhs), type);
+	return make_shared_ptr<SetOpRelation>(std::move(lhs), std::move(rhs), type, setop_all);
 }
 
 shared_ptr<Relation> SubstraitToDuckDB::TransformWriteOp(const substrait::Rel &sop) {
